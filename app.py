@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
 
-from planesounds import adsb, audio as au, doppler, ridge, search, spectro, synth
+from planesounds import adsb, audio as au, cuts as cutmod, doppler, ridge, search, spectro, synth
 from planesounds.dem import ConstantDEM, SRTMDEM
 from planesounds.geo import haversine_m, lla_to_ecef
 
@@ -20,7 +20,8 @@ st.set_page_config(page_title="PlaneSounds", page_icon="✈️", layout="wide")
 pio.templates.default = "plotly_dark"
 S = st.session_state
 for k, v in {"audio": None, "events": [], "sel": None, "trace": None, "fit": None, "flights": None,
-             "result": None, "spec_cache": {}, "area": None, "demo": None, "heat": None}.items():
+             "result": None, "spec_cache": {}, "area": None, "demo": None, "heat": None,
+             "cuts": [], "detected": None}.items():
     S.setdefault(k, v)
 
 UTC = dt.timezone.utc
@@ -53,8 +54,32 @@ def get_spec(win_s, hop_s, f_max, whiten, t0=None, t1=None, f_min=0.0):
     return cache[key]
 
 
+def active_cuts() -> list[float]:
+    """Cut times (audio s) the user has enabled."""
+    return sorted(float(c["t"]) for c in S.cuts if c.get("use", True))
+
+
+def seg_of(t) -> int:
+    return cutmod.segment_of(t, active_cuts())
+
+
+def seg_bounds():
+    return cutmod.segment_bounds(active_cuts(), S.audio.duration if S.audio is not None else 0)
+
+
+def add_cut_markers(fig, t_lo, t_hi):
+    for c in S.cuts:
+        if not (t_lo <= c["t"] <= t_hi):
+            continue
+        on = c.get("use", True)
+        fig.add_vline(x=c["t"], line=dict(color="#00e5ff" if on else "#607d8b", width=2 if on else 1,
+                                          dash="dash" if on else "dot"),
+                      annotation_text="✂" if on else "✂?", annotation_position="top",
+                      annotation_font_color="#00e5ff" if on else "#90a4ae")
+
+
 def spec_figure(s: spectro.Spectrogram, title="", zmax=None, overlays=(), height=460, field="z",
-                selectable=False):
+                selectable=False, show_cuts=True):
     tt, ff, img = spectro.downsample_for_display(s, 1400, 500, field)
     if zmax is None:
         zmax = float(np.percentile(img, 99.5)) if img.size else 1
@@ -63,6 +88,8 @@ def spec_figure(s: spectro.Spectrogram, title="", zmax=None, overlays=(), height
                                hovertemplate="t=%{x:.2f}s<br>f=%{y:.2f}Hz<br>%{z:.2f}<extra></extra>"))
     for ov in overlays:
         fig.add_trace(ov)
+    if show_cuts and len(tt):
+        add_cut_markers(fig, float(tt[0]), float(tt[-1]))
     fig.update_layout(title=title, height=height, margin=dict(l=50, r=10, t=40, b=40),
                       xaxis_title="audio time (s)", yaxis_title="frequency (Hz)",
                       dragmode="select" if selectable else "zoom", showlegend=bool(overlays))
@@ -104,19 +131,24 @@ with st.sidebar:
     st.caption(f"speed of sound ≈ {c_sound():.1f} m/s")
     st.divider()
     st.subheader("Session")
-    if S.events:
-        st.download_button("💾 Save events (JSON)", json.dumps({"events": S.events}, indent=1),
-                           "planesounds_events.json", "application/json")
+    if S.events or S.cuts:
+        st.download_button("💾 Save events + cuts (JSON)",
+                           json.dumps({"events": S.events, "cuts": S.cuts}, indent=1, default=float),
+                           "planesounds_session.json", "application/json")
     up = st.file_uploader("Load events JSON", type=["json"], key="ev_upload")
     if up is not None and st.button("Load events"):
-        S.events = json.load(up).get("events", [])
-        st.success(f"loaded {len(S.events)} events")
+        d = json.load(up)
+        S.events = d.get("events", [])
+        S.cuts = d.get("cuts", S.cuts)
+        st.success(f"loaded {len(S.events)} events, {len(S.cuts)} cuts")
     st.divider()
     if S.audio is not None:
         a = S.audio
         st.markdown(f"**Audio:** {a.title or a.source}  \n{a.duration:.0f} s @ {a.sr} Hz")
         if a.upload_date:
             st.markdown(f"YouTube upload date: **{a.upload_date}**")
+    if S.audio is not None:
+        st.markdown(f"**Cuts:** {len(active_cuts())} → {len(active_cuts()) + 1} segment(s)")
     st.markdown(f"**Events:** {len(S.events)}")
     if S.flights is not None:
         st.markdown(f"**Flight data:** {S.flights.flight_id.nunique()} flights, {len(S.flights):,} points")
@@ -152,22 +184,34 @@ with tabs[0]:
                                progress=lambda x: bar.progress(x, "downloading"))
             bar.progress(1.0, "decoded")
             S.audio, S.spec_cache, S.trace, S.fit, S.sel, S.demo = a, {}, None, None, None, None
+            S.cuts, S.detected, S.events, S.result = [], None, [], None
             st.success(f"Loaded {a.duration:.1f} s of audio")
         except Exception as e:
             st.error(f"Could not load audio: {e}")
+    demo_cut = b2.checkbox("Demo with an edit (500 s cut out of the middle)", False,
+                           help="Simulates a cut YouTube video: 400-900 s is removed and the background "
+                                "noise changes after the cut, so the cut detector has something to find.")
     if b2.button("🧪 Load synthetic demo scenario",
                  help="Two simulated propeller flyovers 920 s apart + background traffic, with matching "
                       "fake ADS-B data. Useful to learn the workflow and verify the pipeline."):
         sc = synth.demo_scenario()
-        S.audio = au.Audio(sc["audio"], sc["sr"], source="synthetic demo", title="Synthetic demo")
+        x = sc["audio"]
+        if demo_cut:
+            sr0 = sc["sr"]
+            rng = np.random.default_rng(1)
+            tail = x[900 * sr0:] * 1.0 + rng.standard_normal(len(x) - 900 * sr0).astype(np.float32) * 0.04
+            x = np.concatenate([x[:400 * sr0], tail]).astype(np.float32)
+        S.audio = au.Audio(x, sc["sr"], source="synthetic demo", title="Synthetic demo" + (" (edited)" if demo_cut else ""))
         S.flights = sc["flights"]
         S.demo = {k: sc[k] for k in ("obs", "rec_start", "duration")}
         S.spec_cache, S.trace, S.fit, S.sel, S.events = {}, None, None, None, []
+        S.cuts, S.detected, S.result = [], None, None
         lat, lon, _ = sc["obs"]
         S.area = {"lat_min": lat - 0.3, "lat_max": lat + 0.3, "lon_min": lon - 0.4, "lon_max": lon + 0.4}
         st.success("Demo loaded. Truth (hidden from the search): "
                    f"{lat:.5f}, {lon:.5f}; recording started {fmt_utc(sc['rec_start'])}. "
-                   "Events are at ~148 s (≈100 Hz) and ~1090 s (≈88 Hz).")
+                   + ("Events at ~148 s and ~590 s, with a cut at 400 s (500 s removed)."
+                      if demo_cut else "Events are at ~148 s (≈100 Hz) and ~1090 s (≈88 Hz)."))
     if S.audio is not None:
         a = S.audio
         st.markdown(f"**{a.title or a.source}** - {a.duration:.1f} s")
@@ -196,21 +240,134 @@ with tabs[1]:
             ov_wh = oc[3].selectbox("Whitening", ["freq", "both", "none"], 0, key="ov_wh",
                                     help="'freq' removes constant hum per frequency; 'both' also removes broadband bursts")
             so = get_spec(ov_win, ov_hop, ov_fmax, ov_wh)
-            st.plotly_chart(spec_figure(so, "Whole recording - look for faint descending curves",
-                                        height=380), width="stretch", theme=None)
-            if st.button("🔎 Auto-detect Doppler candidates"):
-                sd = get_spec(1.0, 0.25, min(800.0, a.sr / 2), "freq")
-                with st.spinner("scanning..."):
-                    S.detected = ridge.detect_candidates(sd, f_lo=30, f_hi=min(700, a.sr / 2 - 10))
-            if S.get("detected"):
-                df = pd.DataFrame(S.detected)[["t_cpa", "f0", "v", "d", "strength", "rms", "t0", "t1", "f_lo", "f_hi"]]
-                st.dataframe(df.round(2), width="stretch")
-                pick = st.selectbox("Use detection as zoom selection", range(len(df)),
-                                    format_func=lambda i: f"#{i}: CPA {df.t_cpa[i]:.1f}s, {df.f0[i]:.1f} Hz")
-                if st.button("Zoom to it"):
+            ov_ovl = []
+            for d in (S.detected or []):
+                ov_ovl.append(line(d["trace_t"], d["trace_f"], f"#{d['id']} CPA {d['t_cpa']:.0f}s", "#76ff03",
+                                   width=3))
+            st.plotly_chart(spec_figure(so, "Whole recording - dashed cyan lines = cuts, green = detected flyovers",
+                                        overlays=ov_ovl, height=400), width="stretch", theme=None)
+
+        # ------------------------------------------------------------ cuts
+        st.subheader("✂️ Cuts / edits")
+        st.caption("Across a cut, the time gap between two plane sounds is unknown. Mark every cut: the search then "
+                   "only uses time offsets *within* an uncut segment, and each segment gets its own start time.")
+        cc = st.columns([1.2, 1.2, 1.6, 1.4])
+        sens = cc[0].slider("Audio cut sensitivity", 0.3, 3.0, 1.0, 0.1,
+                            help="Higher finds more (weaker) cuts, but also more false alarms")
+        if cc[0].button("🔍 Detect cuts from audio"):
+            with st.spinner("analysing background noise..."):
+                found = cutmod.detect_audio_cuts(a.samples, a.sr, sensitivity=sens)
+            old = [cutmod.Cut(c["t"], c["source"], c["strength"], c.get("audio_novelty", float("nan")), c.get("note", ""))
+                   for c in S.cuts if c["source"] not in ("audio", "silence")]
+            S.cuts = [dict(c.to_dict(), use=True) for c in cutmod.merge_cuts(old, found)]
+            st.rerun()
+        vthr = cc[1].slider("Video scene threshold", 0.1, 0.8, 0.35, 0.05,
+                            help="ffmpeg scene-change score; lower finds more cuts")
+        is_url = a.source.startswith(("http", "www.", "youtu"))
+        can_video = is_url or bool(a.media_path and Path(a.media_path).suffix.lower() not in
+                               (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".webm"))
+        if cc[1].button("🎬 Detect cuts from video", disabled=not can_video,
+                        help="Downloads a low-res copy of the video (URL) or uses the uploaded video file"):
+            try:
+                with st.spinner("getting video + detecting scene changes..."):
+                    vp = au.download_video_lowres(a.source) if is_url else Path(a.media_path)
+                    vc = cutmod.detect_video_cuts(vp, vthr, t_offset=a.start_offset)
+                    vc = [c for c in vc if c.t <= a.duration]
+                    vc = cutmod.annotate_with_audio(vc, a.samples, a.sr)
+                old = [cutmod.Cut(c["t"], c["source"], c["strength"], c.get("audio_novelty", float("nan")), c.get("note", ""))
+                       for c in S.cuts if "video" not in c["source"]]
+                merged = cutmod.merge_cuts(old, vc)
+                S.cuts = [dict(c.to_dict(), use=True) for c in merged]
+                st.success(f"{len(vc)} scene cuts found")
+                st.rerun()
+            except Exception as e:
+                st.error(f"video cut detection failed: {e}")
+        man = cc[2].number_input("Add a cut manually at (s)", 0.0, a.duration, 0.0, 0.5)
+        if cc[2].button("➕ Add manual cut"):
+            S.cuts = sorted(S.cuts + [{"t": float(man), "source": "manual", "strength": 99.0,
+                                       "audio_novelty": float("nan"), "note": "", "use": True}], key=lambda c: c["t"])
+            st.rerun()
+        if cc[3].button("🗑️ Clear all cuts", disabled=not S.cuts):
+            S.cuts = []
+            st.rerun()
+        if S.cuts:
+            cdf = pd.DataFrame(S.cuts)[["use", "t", "source", "strength", "audio_novelty", "note"]]
+            ed = st.data_editor(cdf, key="cut_editor", hide_index=True, width="stretch",
+                                column_config={"use": st.column_config.CheckboxColumn("use", help="untick false alarms"),
+                                               "t": st.column_config.NumberColumn("time (s)", format="%.2f"),
+                                               "strength": st.column_config.NumberColumn(format="%.1f"),
+                                               "audio_novelty": st.column_config.NumberColumn("audio change (dB)", format="%.1f")},
+                                disabled=["source", "strength", "audio_novelty", "note"])
+            new_cuts = [dict(r) for r in ed.to_dict("records")]
+            if [(c["t"], c["use"]) for c in new_cuts] != [(c["t"], c["use"]) for c in S.cuts]:
+                S.cuts = sorted(new_cuts, key=lambda c: c["t"])
+                st.rerun()
+            st.caption("Segments: " + " | ".join(f"#{i}: {x0:.1f}-{x1:.1f} s" for i, (x0, x1) in enumerate(seg_bounds()))
+                       + ".  Tip: video cuts marked *audio may be continuous* are often b-roll over unbroken sound - "
+                         "untick them if the background noise really doesn't change.")
+        else:
+            st.caption("No cuts marked - the whole recording is treated as one continuous take.")
+
+        # ------------------------------------------------------------ auto-detect
+        st.subheader("🔎 Auto-detect flyovers")
+        dc = st.columns(4)
+        d_flo = dc[0].number_input("Lowest freq (Hz)", 10.0, 1000.0, 30.0, 5.0)
+        d_fhi = dc[1].number_input("Highest freq (Hz)", 50.0, a.sr / 2 - 10, min(700.0, a.sr / 2 - 10), 10.0)
+        d_str = dc[2].number_input("Min ridge strength (σ)", 0.5, 6.0, 1.5, 0.25,
+                                   help="Lower to find fainter curves (more false alarms)")
+        dc[3].markdown(" ")
+        if dc[3].button("🔎 Scan whole recording", type="primary"):
+            sd = get_spec(1.0, 0.25, min(d_fhi + 50, a.sr / 2), "freq")
+            bar = st.progress(0.0, "scanning (never across a cut)...")
+            det = ridge.detect_candidates(sd, cuts=active_cuts(), f_lo=d_flo, f_hi=d_fhi, min_strength=d_str,
+                                          progress=lambda x: bar.progress(x, "scanning (never across a cut)..."))
+            det.sort(key=lambda d: d["t_cpa"])
+            for i, d in enumerate(det):
+                d["id"] = i
+                d["segment"] = seg_of(d["t_cpa"])
+            S.detected = det
+            st.rerun()
+        if S.detected is not None:
+            if not S.detected:
+                st.warning("No flyovers detected. Try a lower strength threshold, or look manually.")
+            else:
+                existing = [e["t_cpa"] for e in S.events]
+                ddf = pd.DataFrame([{"add": d.get("good", True) and all(abs(d["t_cpa"] - t) > 10 for t in existing),
+                                     "quality": "✅ good" if d.get("good", True) else "⚠️ weak", "id": d["id"],
+                                     "segment": d["segment"], "CPA (s)": d["t_cpa"], "f0 (Hz)": d["f0"],
+                                     "speed (m/s)": d["v"], "CPA dist (m)": d["d"], "lines (Hz)": str(d["lines"]),
+                                     "strength": d["strength"], "fit rms (Hz)": d["rms"]} for d in S.detected])
+                st.caption("Only good-quality detections are ticked. Weak ones (poor fit, implausibly slow, faint) "
+                           "are often noise - zoom in and check before adding them. One false event can make the "
+                           "search find nothing.")
+                ded = st.data_editor(ddf.round(2), key="det_editor", hide_index=True, width="stretch",
+                                     disabled=[c for c in ddf.columns if c != "add"])
+                b1c, b2c = st.columns(2)
+                if b1c.button("➕ Add ticked detections as events", type="primary"):
+                    c = c_sound()
+                    n_add = 0
+                    bounds = seg_bounds()
+                    for row in ded.to_dict("records"):
+                        if not row["add"]:
+                            continue
+                        d = S.detected[int(row["id"])]
+                        fit = doppler.fit_linear(d["trace_t"], d["trace_f"], c, weights=d["trace_s"])
+                        rg = fit.ranges()
+                        sa, sb = bounds[seg_of(fit.t_cpa)]
+                        harm = [h for h in d["harmonics_hint"] if abs(h - round(h)) < 0.05 and round(h) <= 4]
+                        e = search.Event(name=f"auto {fit.t_cpa:.0f}s", t_cpa=fit.t_cpa, f0=fit.f0, v_range=rg["v"],
+                                         d_range=rg["d"], t_window=(max(sa, fit.t_cpa - 60), min(sb, fit.t_cpa + 60)),
+                                         f_band=(d["f_lo"], d["f_hi"]), harmonics=[float(round(h)) for h in harm] or [1.0],
+                                         trace_t=list(map(float, d["trace_t"])), trace_f=list(map(float, d["trace_f"])))
+                        S.events.append(e.to_dict())
+                        n_add += 1
+                    S.events.sort(key=lambda e: e["t_cpa"])
+                    st.success(f"added {n_add} events - review them in tab 3")
+                pick = b2c.selectbox("Zoom to detection", range(len(S.detected)),
+                                     format_func=lambda i: f"#{i}: CPA {S.detected[i]['t_cpa']:.1f}s, {S.detected[i]['f0']:.1f} Hz")
+                if b2c.button("🔍 Zoom to it"):
                     d = S.detected[pick]
-                    S.sel = {"t0": max(0, d["t_cpa"] - 90), "t1": min(a.duration, d["t_cpa"] + 90),
-                             "f0": d["f_lo"], "f1": d["f_hi"]}
+                    S.sel = {"t0": float(d["t0"]), "t1": float(d["t1"]), "f0": float(d["f_lo"]), "f1": float(d["f_hi"])}
                     st.rerun()
 
         st.subheader("Zoom")
@@ -269,6 +426,10 @@ with tabs[2]:
         sel = S.sel or {"t0": 0.0, "t1": min(a.duration, 240.0), "f0": 40.0, "f1": 400.0}
         st.caption(f"Current selection: {sel['t0']:.1f}-{sel['t1']:.1f} s, {sel['f0']:.1f}-{sel['f1']:.1f} Hz "
                    "(set it in the Spectrogram tab). Select one harmonic line of one pass-by, ideally the clearest.")
+        crossing = [c for c in active_cuts() if sel["t0"] < c < sel["t1"]]
+        if crossing:
+            st.warning(f"⚠️ The selection crosses a cut at {', '.join(f'{c:.1f}' for c in crossing)} s. Audio on either "
+                       "side comes from different moments - trim the selection to one side before tracing.")
         cc = st.columns(5)
         win = cc[0].select_slider("Window (s)", [0.5, 1.0, 2.0, 3.0], 1.0, key="ev_win")
         slope = cc[1].number_input("Max slope (Hz/s)", 0.2, 30.0, 3.0, 0.5,
@@ -337,7 +498,8 @@ with tabs[2]:
                     hs = [1.0]
                 e = search.Event(name=name, t_cpa=float(t_c), f0=float(f_c),
                                  v_range=(max(5.0, v_c - vw), v_c + vw), d_range=(max(30.0, d_c - dw), d_c + dw),
-                                 t_window=(max(0.0, t_c - twin), min(a.duration, t_c + twin)),
+                                 t_window=(max(seg_bounds()[seg_of(t_c)][0], t_c - twin),
+                                           min(seg_bounds()[seg_of(t_c)][1], t_c + twin)),
                                  f_band=(sel["f0"], sel["f1"]), harmonics=hs or [1.0],
                                  trace_t=list(map(float, S.trace[0])), trace_f=list(map(float, S.trace[1])),
                                  score_mode=mode, allow_jets=jets)
@@ -347,11 +509,18 @@ with tabs[2]:
 
         if S.events:
             st.subheader("Saved events")
-            df = pd.DataFrame([{k: v for k, v in e.items() if k not in ("trace_t", "trace_f")} for e in S.events])
+            df = pd.DataFrame([{"segment": seg_of(e["t_cpa"]), **{k: v for k, v in e.items()
+                                                                     if k not in ("trace_t", "trace_f")}}
+                               for e in S.events])
             st.dataframe(df, width="stretch")
             if len(S.events) > 1:
-                gaps = np.diff([e["t_cpa"] for e in S.events])
-                st.caption("Offsets between events: " + ", ".join(f"{g:.1f} s" for g in gaps))
+                parts = []
+                for e0, e1 in zip(S.events[:-1], S.events[1:]):
+                    if seg_of(e0["t_cpa"]) == seg_of(e1["t_cpa"]):
+                        parts.append(f"{e0['name']} → {e1['name']}: **{e1['t_cpa'] - e0['t_cpa']:.1f} s**")
+                    else:
+                        parts.append(f"{e0['name']} → {e1['name']}: **unknown (cut in between)**")
+                st.markdown("Time offsets used by the search: " + " · ".join(parts))
             dc = st.columns([2, 1])
             rm = dc[0].selectbox("Remove event", range(len(S.events)), format_func=lambda i: S.events[i]["name"])
             if dc[1].button("🗑️ Remove"):
@@ -540,7 +709,23 @@ with tabs[4]:
                             help="Reject places that would have heard other aircraft while the recording is quiet")
         srad = c[2].number_input("Silence radius props (m)", 200.0, 20000.0, 2500.0, 100.0)
         srj = c[3].number_input("Silence radius jets (m)", 200.0, 30000.0, 4500.0, 100.0)
-        spans_default = search.default_clean_spans([search.Event(**e) for e in S.events], a.duration, 15.0)
+        ev_objs = [search.Event(**e) for e in S.events]
+        segs_used = sorted({seg_of(e.t_cpa) for e in ev_objs})
+        if len(segs_used) > 1:
+            st.info(f"Your events are in {len(segs_used)} different uncut segments ({segs_used}). Time offsets are only "
+                    "enforced inside a segment. Without timing across a cut, each flight pins the location to a "
+                    "*distance* from its track but not *where along it*, so expect several near-tied candidate "
+                    "sites. Constraining how much time each cut removed helps a lot.")
+            kc = st.columns(3)
+            chrono = kc[0].checkbox("Segments are in chronological order", True,
+                                    help="Usual for vlogs/edits: later in the video = later in real time")
+            rm_max = kc[1].number_input("Max time removed per cut (min, 0 = unknown)", 0.0, 1440.0, 0.0, 1.0,
+                                        help="e.g. 10 if you believe each cut skips at most ~10 minutes")
+            rm_min = kc[2].number_input("Min time removed per cut (s)", 0.0, 86400.0, 0.0, 1.0)
+            cut_removed = (rm_min, rm_max * 60 if rm_max > 0 else None) if chrono else None
+        else:
+            cut_removed = (0.0, None)
+        spans_default = search.default_clean_spans(ev_objs, a.duration, 15.0, active_cuts())
         spans_txt = st.text_input("Quiet spans (audio s) - no aircraft audible",
                                   "; ".join(f"{s0:.0f}-{s1:.0f}" for s0, s1 in spans_default),
                                   help="Edit if other (unused) aircraft are audible somewhere in the recording")
@@ -564,7 +749,7 @@ with tabs[4]:
                 t0_range=S.t0_range, duration=a.duration, grid_m=grid_m, refine_m=min(refine_m, grid_m),
                 c=c_sound(), offset_tol_s=tol, exclude_jets=excl, silence=sil, silence_radius_m=srad,
                 silence_radius_jet_m=srj, clean_spans=spans, max_score_points=int(maxp), dt_sweep_s=dts,
-                alt_offset_m=alt_off)
+                alt_offset_m=alt_off, cuts=active_cuts(), cut_removed_s=cut_removed)
             bar = st.progress(0.0, "starting")
             res = search.run_search(S.flights, evs, spec_full, cfg, make_dem(),
                                     progress=lambda x, m: bar.progress(x, m))
@@ -597,17 +782,29 @@ with tabs[4]:
                     fig = go.Figure(go.Histogram(x=best.score, nbinsx=50))
                     fig.update_layout(xaxis_title="score", height=420, title="Best score per flight (right is better)")
                 c1.plotly_chart(fig, width="stretch", theme=None)
-                top = best.head(50)
+                sites = res.sites if res.sites is not None else best
+                if S.demo:
+                    sites = sites.assign(err_m=haversine_m(o[0], o[1], sites.lat, sites.lon))
+                top = sites.head(50)
                 fm = go.Figure(go.Scattermap(lat=top.lat, lon=top.lon, mode="markers",
                                              marker=dict(size=10, color=top.score, colorscale="Viridis", showscale=True),
                                              text=[f"#{i} score {s:.2f}" for i, s in zip(top.index, top.score)]))
                 fm.update_layout(map=dict(style="open-street-map", center=dict(lat=top.lat.iloc[0], lon=top.lon.iloc[0]),
                                           zoom=9), height=420, margin=dict(l=0, r=0, t=0, b=0))
                 c2.plotly_chart(fm, width="stretch", theme=None)
-                cols = ["lat", "lon", "score"] + [f"score_{k}" for k in range(len(evs))] + ["start_utc"] + \
+                near = int((sites.rel_score > 0.98).sum()) if "rel_score" in sites else 1
+                if near > 1:
+                    st.warning(f"{near} distinct sites score within 2 % of the best one - treat them all as candidates "
+                               "(check each in tab 6 / Street View).")
+                st.markdown("**Candidate sites** (distinct locations, ≥750 m apart per flight combination)")
+                cols = ["lat", "lon", "score", "rel_score"] + [f"score_{k}" for k in range(len(evs))] + ["start_utc"] + \
+                       [c for c in sites.columns if c.startswith("removed_")] + \
                        sum([[f"callsign_{k}", f"type_{k}", f"d_{k}", f"speed_{k}"] for k in range(len(evs))], []) + \
-                       (["err_m"] if "err_m" in best else [])
-                st.dataframe(best[cols].head(200), width="stretch")
+                       (["err_m"] if "err_m" in sites else [])
+                st.dataframe(sites[[c for c in cols if c in sites]].head(200), width="stretch")
+                if any(c.startswith("removed_") for c in sites.columns):
+                    st.caption("removed_sA_sB = how many seconds of real time the cut between segment A and B skipped "
+                               "(estimated from the flight timings).")
                 st.download_button("⬇️ Results CSV", res.results.to_csv(index=False), "planesounds_results.csv")
 
 # ---------------------------------------------------------------------------
@@ -619,11 +816,17 @@ with tabs[5]:
         st.info("Run a search first.")
     else:
         res, evs, cfg, spec_full = S.result["res"], S.result["events"], S.result["cfg"], S.result["spec"]
-        best = res.best_per_combo
-        i = st.selectbox("Candidate", range(min(len(best), 100)),
+        best = res.sites if res.sites is not None else res.best_per_combo
+        i = st.selectbox("Candidate site", range(min(len(best), 100)),
                          format_func=lambda i: f"#{i}: score {best.score[i]:.2f} @ {best.lat[i]:.5f}, {best.lon[i]:.5f}")
         row = best.iloc[i]
         lat, lon = float(row.lat), float(row.lon)
+        ev_T0 = [float(row[f"T0_{k}"]) if f"T0_{k}" in row else float(row.T0) for k in range(len(evs))]
+        seg_cols = sorted(c for c in row.index if c.startswith("T0_s"))
+        if len(seg_cols) > 1:
+            st.markdown("Segment start times (audio t=0 of each uncut segment): " + " · ".join(
+                f"segment {c[4:]}: **{fmt_utc(row[c])}**" for c in seg_cols)
+                + "  \n(these are the times audio t=0 *would* correspond to if that segment ran from the start)")
         st.markdown(f"**{lat:.6f}, {lon:.6f}** · recording started ≈ **{fmt_utc(row.T0)}** · "
                     f"[Google Maps](https://www.google.com/maps/search/?api=1&query={lat},{lon}) · "
                     f"[Street View](https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}) · "
@@ -633,9 +836,9 @@ with tabs[5]:
                                     "class": t.propulsion, "score": row[f"score_{k}"], "slant CPA (m)": row[f"d_{k}"],
                                     "speed (m/s)": row[f"speed_{k}"], "f0 best": row[f"f0_{k}"]}
                                    for k, (e, t) in enumerate(zip(evs, trs))]), width="stretch")
-        scorer = search.Scorer(spec_full, evs, cfg.c, cfg.dt_sweep_s, cfg.f0_sweep_frac)
+        scorer = search.Scorer(spec_full, evs, cfg.c, cfg.dt_sweep_s, cfg.f0_sweep_frac, cfg.cuts)
         obs = lla_to_ecef(lat, lon, row.elev)
-        curves = scorer.model_curves(trs, obs, row.T0, [row[f"f0_{k}"] for k in range(len(evs))])
+        curves = scorer.model_curves(trs, obs, ev_T0, [row[f"f0_{k}"] for k in range(len(evs))])
         hide = st.checkbox("Hide modelled curves", False)
         cols = st.columns(len(evs))
         for k, (e, (ta, fa)) in enumerate(zip(evs, curves)):
@@ -651,7 +854,7 @@ with tabs[5]:
         # map with tracks
         fm = go.Figure()
         for k, t in enumerate(trs):
-            m = np.abs(t.t - (row.T0 + evs[k].t_cpa)) < 400
+            m = np.abs(t.t - (ev_T0[k] + evs[k].t_cpa)) < 400
             fm.add_trace(go.Scattermap(lat=t.lat[m], lon=t.lon[m], mode="lines", name=f"{evs[k].name}: {t.callsign or t.fid}"))
         fm.add_trace(go.Scattermap(lat=[lat], lon=[lon], mode="markers", marker=dict(size=14, color="red"), name="candidate"))
         if S.heat is not None and S.heat.get("i") == i:
@@ -670,7 +873,8 @@ with tabs[5]:
         if hc[2].button("🔥 Fine heat-map for this flight combination"):
             bar = st.progress(0.0)
             h = search.focus_heatmap(trs, evs, spec_full, (lat, lon), hr, hs, make_dem(), cfg.c,
-                                     cfg.dt_sweep_s, cfg.f0_sweep_frac, progress=lambda x: bar.progress(x))
+                                     cfg.dt_sweep_s, cfg.f0_sweep_frac, progress=lambda x: bar.progress(x),
+                                     cuts=cfg.cuts)
             S.heat = {"i": i, "df": h}
             st.rerun()
         if S.heat is not None and S.heat.get("i") == i:

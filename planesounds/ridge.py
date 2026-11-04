@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks
 
 from .spectro import Spectrogram, enhance_lines
 
@@ -64,46 +65,103 @@ def clean_trace(t, f, strength, min_strength: float = 1.5, smooth: int = 3):
     return t[keep], f[keep], strength[keep]
 
 
-def detect_candidates(s: Spectrogram, f_lo=40.0, f_hi=600.0, win_s=90.0, step_s=20.0,
-                      min_drop_frac=0.08, min_strength=2.0, top=15):
-    """Scan the recording for descending tonal ridges that look like a pass-by.
+def _segments(t_start, t_end, cuts):
+    edges = [t_start] + sorted(c for c in cuts if t_start < c < t_end) + [t_end]
+    return list(zip(edges[:-1], edges[1:]))
 
-    Returns a list of dicts with a suggested selection box, sorted by score.
-    This is a *helper* - always review suggestions on the spectrogram.
+
+def detect_candidates(s: Spectrogram, cuts=(), f_lo=40.0, f_hi=600.0, win_s=120.0, step_s=20.0,
+                      min_drop_frac=0.04, min_strength=1.5, lines_per_window=3, cut_margin_s=1.0,
+                      top=40, group_s=30.0, progress=None):
+    """Scan the whole recording for descending tonal ridges (aircraft pass-bys).
+
+    * Never traces across a cut: each uncut segment is scanned on its own.
+    * Several candidate lines per window (fundamental + harmonics, or two
+      aircraft) are traced.
+    * Lines with the same CPA time are grouped as one aircraft; the strongest
+      line is kept and the others are listed as its extra lines/harmonics.
+
+    Returns dicts (sorted by score) including the trace itself, so a detection
+    can be saved as an event without re-tracing. Always review them visually.
     """
     from .doppler import fit_linear
 
-    out = []
-    t_start, t_end = s.t[0], s.t[-1]
-    t0 = t_start
-    while t0 + 10 < t_end:
-        t1 = min(t0 + win_s, t_end)
+    raw = []
+    segs = [(a + cut_margin_s, b - cut_margin_s) for a, b in _segments(float(s.t[0]), float(s.t[-1]), cuts)]
+    segs = [(a, b) for a, b in segs if b - a >= 25]
+    jobs = []
+    for si, (a, b) in enumerate(segs):
+        w = min(win_s, b - a)
+        t0 = a
+        while True:
+            jobs.append((si, t0, min(t0 + w, b)))
+            if t0 + w >= b:
+                break
+            t0 += step_s
+    for n, (si, t0, t1) in enumerate(jobs):
+        if progress and n % 5 == 0:
+            progress(n / max(len(jobs), 1))
         sub = s.crop(t0, t1, f_lo, f_hi)
-        if sub.z.size == 0:
-            break
-        # find strongest persistent line in this window
-        prof = enhance_lines(sub.z, 9).mean(axis=1)
-        fc = float(sub.f[int(np.argmax(prof))])
-        band = (max(f_lo, fc * 0.75), min(f_hi, fc * 1.3))
-        try:
-            tt, ff, st = trace_ridge(s, t0, t1, *band)
-            tt, ff, st = clean_trace(tt, ff, st, min_strength)
-            if len(tt) > 20:
-                drop = (np.percentile(ff, 95) - np.percentile(ff, 5)) / np.median(ff)
-                if drop >= min_drop_frac:
-                    fit = fit_linear(tt, ff)
-                    if t0 <= fit.t_cpa <= t1 and fit.rms_hz < 0.03 * fit.f0:
-                        out.append({"t0": t0, "t1": t1, "f_lo": band[0], "f_hi": band[1],
-                                    "t_cpa": fit.t_cpa, "f0": fit.f0, "v": fit.v, "d": fit.d,
-                                    "strength": float(np.median(st)), "rms": fit.rms_hz,
-                                    "score": float(np.median(st) * len(tt) * drop)})
-        except Exception:
-            pass
-        t0 += step_s
-    # de-duplicate by CPA time
-    out.sort(key=lambda d: -d["score"])
-    kept = []
-    for c in out:
-        if all(abs(c["t_cpa"] - k["t_cpa"]) > 20 for k in kept):
-            kept.append(c)
-    return kept[:top]
+        if sub.z.shape[0] < 5 or sub.z.shape[1] < 10:
+            continue
+        prof = np.percentile(enhance_lines(sub.z, 9), 75, axis=1)
+        pk, pr = find_peaks(prof, prominence=0.3)
+        if not len(pk):
+            continue
+        order = np.argsort(-pr["prominences"])[:lines_per_window]
+        for i in pk[order]:
+            fc = float(sub.f[i])
+            # the profile peak may be the approach plateau, the recede plateau or the middle:
+            # try each hypothesis and keep the best fit (a fast plane drops ~1.5-1.9x in pitch)
+            best = None
+            for lo_k, hi_k in ((1 / 1.9, 1.08), (0.92, 1.9), (1 / 1.4, 1.4)):
+                band = (max(f_lo, fc * lo_k), min(f_hi, fc * hi_k))
+                try:
+                    tt, ff, st = trace_ridge(s, t0, t1, *band)
+                    tt, ff, st = clean_trace(tt, ff, st, min_strength)
+                    if len(tt) < 0.3 * (t1 - t0) / s.dt or len(tt) < 20:
+                        continue
+                    drop = np.percentile(ff, 95) / max(np.percentile(ff, 5), 1e-6) - 1
+                    if drop < min_drop_frac:
+                        continue
+                    fit = fit_linear(tt, ff, weights=st)
+                    margin = 0.15 * (t1 - t0)
+                    if not (t0 + margin <= fit.t_cpa <= t1 - margin) or fit.rms_hz > 0.01 * fit.f0:
+                        continue
+                    cov = len(tt) * s.dt / (t1 - t0)
+                    q = float(np.median(st) * cov * min(drop, 0.6) * 100 / (1 + 300 * fit.rms_hz / fit.f0))
+                    if best is None or q > best["score"]:
+                        best = {"segment": si, "t0": t0, "t1": t1, "f_lo": band[0], "f_hi": band[1],
+                                "t_cpa": fit.t_cpa, "f0": fit.f0, "v": fit.v, "d": fit.d, "rms": fit.rms_hz,
+                                "strength": float(np.median(st)), "coverage": cov, "score": q,
+                                "trace_t": tt, "trace_f": ff, "trace_s": st}
+                except Exception:
+                    continue
+            if best is not None:
+                raw.append(best)
+    # group by aircraft (same CPA time), keep the best line, remember the others
+    raw.sort(key=lambda d: -d["score"])
+    groups: list[dict] = []
+    for c in raw:
+        g = next((g for g in groups if g["segment"] == c["segment"]
+                  and abs(g["t_cpa"] - c["t_cpa"]) < group_s), None)
+        if g is None:
+            c["lines"] = [round(c["f0"], 1)]
+            groups.append(c)
+            continue
+        # another line of the same pass-by: keep it only if it is a clean harmonic
+        # (integer ratio to the best line, or the best line is a harmonic of it)
+        r = c["f0"] / g["f0"]
+        k = max(round(r), 1) if r >= 1 else 1 / max(round(1 / r), 1)
+        if abs(r / k - 1) < 0.03 and abs(c["t_cpa"] - g["t_cpa"]) < 6 \
+                and all(abs(c["f0"] / f - 1) > 0.03 for f in g["lines"]):
+            g["lines"].append(round(c["f0"], 1))
+    for g in groups:
+        # quality flag used by the UI to pre-select good detections
+        g["good"] = bool(g["rms"] < 0.004 * g["f0"] and g["v"] >= 30 and g["strength"] >= 2.0
+                         and g["coverage"] >= 0.4)
+        base = g["f0"]
+        g["harmonics_hint"] = sorted({round(f / base, 2) for f in g["lines"]})
+        g["n_lines"] = len(g["lines"])
+    groups.sort(key=lambda d: d["t_cpa"])
+    return sorted(groups, key=lambda d: -d["score"])[:top]

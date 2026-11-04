@@ -89,3 +89,57 @@ def test_readsb_trace_parsing(tmp_path):
         tf.add(d / "trace_full_a1b2c3.json", arcname="./traces/c3/trace_full_a1b2c3.json")
     df2 = adsb.load_readsb_traces([tar], bbox=(39, 41, -74, -72))
     assert len(df2) == 3
+
+
+def test_cut_detection_audio():
+    from planesounds import cuts
+    sr = 8000
+    rng = np.random.default_rng(0)
+    w = lambda sec, lvl: rng.standard_normal(int(sec * sr)) * lvl
+    b = np.cumsum(rng.standard_normal(40 * sr)); b -= np.convolve(b, np.ones(sr) / sr, "same")
+    x = np.concatenate([b / b.std() * 0.05, w(35, 0.03), np.diff(w(30, 0.05), prepend=0)]).astype(np.float32)
+    found = [c.t for c in cuts.detect_audio_cuts(x, sr)]
+    assert len(found) == 2 and abs(found[0] - 40) < 0.5 and abs(found[1] - 75) < 0.5, found
+    # a continuous recording must not produce cuts
+    assert cuts.detect_audio_cuts(synth.demo_scenario()["audio"], sr) == []
+
+
+def test_auto_detect_finds_both_flyovers():
+    sc = synth.demo_scenario()
+    spec = spectro.compute(sc["audio"], sc["sr"], f_max=750)
+    d = sorted(ridge.detect_candidates(spec), key=lambda x: x["t_cpa"])
+    assert len(d) == 2
+    assert abs(d[0]["t_cpa"] - 148) < 3 and abs(d[1]["t_cpa"] - 1090) < 3
+    assert 2.0 in d[0]["harmonics_hint"]
+
+
+def test_search_across_a_cut():
+    """Remove 500 s from the middle: the gap between the events is now wrong.
+    With the cut marked the search must still find the place."""
+    sc = synth.demo_scenario()
+    sr, cut = sc["sr"], 400.0
+    x = np.concatenate([sc["audio"][: int(cut * sr)], sc["audio"][int(900 * sr):]])
+    spec = spectro.compute(x, sr, f_max=400, win_s=1.0, hop_s=0.25)
+    e1 = _measure(spec, 60, 260, 60, 140, "event 1")
+    e2 = _measure(spec, 480, 680, 50, 120, "event 2")   # true CPA 1090 -> 590 after the edit
+    o = sc["obs"]
+    base = dict(bbox=(o[0] - 0.15, o[0] + 0.15, o[1] - 0.2, o[1] + 0.2),
+                t0_range=(sc["rec_start"] - 3 * 3600, sc["rec_start"] + 3 * 3600),
+                duration=len(x) / sr, max_score_points=6000)
+    res = search.run_search(sc["flights"], [e1, e2], spec, search.SearchConfig(**base), ConstantDEM(o[2]))
+    if not res.results.empty:   # without the cut, the true pair cannot match the (wrong) offset
+        assert not (res.results.fid_0.str.startswith("a1b2c3") & res.results.fid_1.str.startswith("d4e5f6")).any()
+    # cut marked, amount removed unknown: the flight pair is certain, and the true spot is among
+    # the near-tied distinct sites (along-track / mirror ambiguity without inter-segment timing)
+    res = search.run_search(sc["flights"], [e1, e2], spec, search.SearchConfig(**base, cuts=[cut]),
+                            ConstantDEM(o[2]))
+    assert (res.results.fid_0.iloc[0].startswith("a1b2c3") and res.results.fid_1.iloc[0].startswith("d4e5f6"))
+    near = res.sites[res.sites.rel_score > 0.99]
+    assert (haversine_m(o[0], o[1], near.lat, near.lon) < 400).any()
+    # knowing roughly how much was cut ("under ~8.5 min") resolves it
+    res = search.run_search(sc["flights"], [e1, e2], spec,
+                            search.SearchConfig(**base, cuts=[cut], cut_removed_s=(0, 520)), ConstantDEM(o[2]))
+    top = res.results.iloc[0]
+    assert haversine_m(o[0], o[1], top.lat, top.lon) < 400, res.log
+    assert abs(top.T0_s0 - sc["rec_start"]) < 3                    # segment 0 starts at the real start
+    assert abs(top.removed_s0_s1 - 500) < 4                        # recovers how much time was cut out

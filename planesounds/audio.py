@@ -23,6 +23,8 @@ class Audio:
     title: str = ""
     upload_date: str = ""  # YYYYMMDD from YouTube metadata (if any)
     meta: dict | None = None
+    start_offset: float = 0.0   # seconds trimmed from the start of the original file
+    media_path: str = ""        # local file the audio was decoded from
 
     @property
     def duration(self) -> float:
@@ -58,7 +60,8 @@ def decode_file(path: str | Path, sr: int = 8000, start: float | None = None,
     if out.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {out.stderr.decode(errors='ignore')[:500]}")
     x = np.frombuffer(out.stdout, dtype=np.float32).copy()
-    return Audio(x, sr, source=str(path), title=path.stem)
+    return Audio(x, sr, source=str(path), title=path.stem, start_offset=float(start or 0.0),
+                 media_path=str(path))
 
 
 def download_youtube(url: str, cache_dir: Path = CACHE_DIR, progress=None) -> tuple[Path, dict]:
@@ -106,6 +109,32 @@ def download_youtube(url: str, cache_dir: Path = CACHE_DIR, progress=None) -> tu
     keep["_file"] = str(fname)
     meta_path.write_text(json.dumps(keep, default=str))
     return fname, keep
+
+
+def download_video_lowres(url: str, cache_dir: Path = CACHE_DIR, progress=None) -> Path:
+    """Low-resolution, video-only copy (for scene-cut detection). Cached."""
+    import yt_dlp
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(url.strip().encode()).hexdigest()[:16] + "_video"
+    have = [c for c in cache_dir.glob(f"{key}.*") if c.suffix not in (".json", ".part")]
+    if have:
+        return have[0]
+
+    def hook(d):
+        if progress and d.get("status") == "downloading":
+            tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            if tot:
+                progress(min(d.get("downloaded_bytes", 0) / tot, 1.0))
+
+    opts = {"format": "worstvideo[height>=144]/bv*[height<=360]/worst", "outtmpl": str(cache_dir / f"{key}.%(ext)s"),
+            "quiet": True, "no_warnings": True, "noplaylist": True, "progress_hooks": [hook]}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        f = Path(ydl.prepare_filename(info))
+    if not f.exists():
+        f = next(c for c in cache_dir.glob(f"{key}.*") if c.suffix not in (".json", ".part"))
+    return f
 
 
 def load_source(src: str, sr: int = 8000, start=None, end=None, progress=None) -> Audio:

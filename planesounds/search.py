@@ -31,6 +31,7 @@ from scipy.ndimage import maximum_filter1d
 from scipy.spatial import cKDTree
 
 from .doppler import resample_track, track_received_curve
+from .cuts import segment_bounds, segment_of
 from .geo import Grid, lla_to_ecef, offset_latlon
 from .spectro import Spectrogram
 
@@ -85,6 +86,10 @@ class SearchConfig:
     smooth_s: float = 4.0
     alt_offset_m: float = 0.0                      # add to all ADS-B altitudes
     max_gap_s: float = 90.0
+    cuts: list[float] = field(default_factory=list)   # audio times of edits/cuts
+    # time removed at each cut (s): (min, max). (0, None) = segments are in chronological
+    # order, unknown amount removed. None = segments may be in any order.
+    cut_removed_s: tuple[float, float | None] | None = (0.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -230,20 +235,48 @@ def _cell_xyz(keys, lat, lon, dem, cache):
     return lla_to_ecef(lat, lon, elev)
 
 
-def combine_events(cands: list[pd.DataFrame], events: list[Event], tol: float) -> pd.DataFrame:
-    """Join per-event candidate tables on grid cell, enforcing the time offsets."""
+def event_segments(events: list[Event], cuts) -> list[int]:
+    """Segment index (between cuts) of every event."""
+    return [segment_of(e.t_cpa, cuts or []) for e in events]
+
+
+def combine_events(cands: list[pd.DataFrame], events: list[Event], tol: float, segs=None,
+                   cut_removed=(0.0, None)) -> pd.DataFrame:
+    """Join per-event candidate tables on grid cell.
+
+    Events in the *same* uncut segment must reproduce their observed time
+    offset (within ``tol``). Events in different segments (separated by a cut)
+    only have to agree on the location: each segment gets its own start time.
+    Adds ``T0_s{seg}`` columns (unix time of audio t=0 implied by that segment).
+    """
+    segs = list(segs) if segs is not None else [0] * len(events)
+    first_in_seg: dict[int, int] = {}
     base = cands[0].rename(columns={c: f"{c}_0" for c in ("fid", "heard", "d", "speed", "T0")})
+    first_in_seg[segs[0]] = 0
     for k in range(1, len(cands)):
         ck = cands[k].rename(columns={c: f"{c}_{k}" for c in ("fid", "heard", "d", "speed", "T0")})
         base = base.merge(ck, on="key", how="inner")
-        base = base[np.abs(base[f"T0_{k}"] - base["T0_0"]) <= tol]
+        j = first_in_seg.setdefault(segs[k], k)
+        if j != k:
+            base = base[np.abs(base[f"T0_{k}"] - base[f"T0_{j}"]) <= tol]
+        elif cut_removed is not None and segs[k - 1] != segs[k]:
+            # new segment after a cut: T0 jumps by the amount of time removed
+            p = first_in_seg[segs[k - 1]]
+            removed = base[f"T0_{k}"] - base[f"T0_{p}"]
+            lo, hi = cut_removed
+            ok = removed >= (lo or 0.0) - tol
+            if hi is not None:
+                ok &= removed <= hi + tol
+            base = base[ok]
         for j in range(k):
             base = base[base[f"fid_{k}"] != base[f"fid_{j}"]]
         if base.empty:
             break
-    tcols = [f"T0_{k}" for k in range(len(cands)) if f"T0_{k}" in base]
     base = base.copy()
-    base["T0"] = base[tcols].mean(axis=1) if len(base) else []
+    for sg in sorted(set(segs)):
+        cols = [f"T0_{k}" for k in range(len(events)) if segs[k] == sg and f"T0_{k}" in base]
+        base[f"T0_s{sg}"] = base[cols].mean(axis=1) if len(base) and cols else np.nan
+    base["T0"] = base[f"T0_s{segs[0]}"] if len(base) else []
     return base.reset_index(drop=True)
 
 
@@ -251,16 +284,27 @@ def combine_events(cands: list[pd.DataFrame], events: list[Event], tol: float) -
 # Stage 5: silence
 # ---------------------------------------------------------------------------
 
-def default_clean_spans(events: list[Event], duration: float, pad: float) -> list[tuple[float, float]]:
-    busy = sorted((max(0, e.t_window[0] - pad), min(duration, e.t_window[1] + pad)) for e in events)
-    spans, cur = [], 0.0
-    for a, b in busy:
-        if a > cur:
-            spans.append((cur, a))
-        cur = max(cur, b)
-    if cur < duration:
-        spans.append((cur, duration))
-    return [s for s in spans if s[1] - s[0] > 5]
+def default_clean_spans(events: list[Event], duration: float, pad: float, cuts=()) -> list[tuple[float, float]]:
+    """Quiet spans = everything except the event windows, never crossing a cut
+    (a small margin is left around every cut). Only segments that contain at
+    least one event are returned - elsewhere the start time is unknown."""
+    bounds = segment_bounds(cuts or [], duration)
+    ev_segs = {segment_of(e.t_cpa, cuts or []) for e in events}
+    spans = []
+    for si, (sa, sb) in enumerate(bounds):
+        if si not in ev_segs:
+            continue
+        sa2, sb2 = (sa + 1.0 if si > 0 else sa), (sb - 1.0 if si < len(bounds) - 1 else sb)
+        busy = sorted((max(sa2, e.t_window[0] - pad), min(sb2, e.t_window[1] + pad))
+                      for e in events if segment_of(e.t_cpa, cuts or []) == si)
+        cur = sa2
+        for a, b in busy:
+            if a > cur:
+                spans.append((cur, a))
+            cur = max(cur, b)
+        if cur < sb2:
+            spans.append((cur, sb2))
+    return [sp for sp in spans if sp[1] - sp[0] > 5]
 
 
 def silence_violations(surv: pd.DataFrame, n_events: int, tracks: dict[str, Track], cfg: SearchConfig,
@@ -274,6 +318,14 @@ def silence_violations(surv: pd.DataFrame, n_events: int, tracks: dict[str, Trac
     obs = _cell_xyz(ukeys, lat, lon, dem, cell_cache)
     tree = cKDTree(obs)
     spans = np.asarray(spans, dtype=float)
+    seg_ids = sorted(int(c[4:]) for c in surv.columns if c.startswith("T0_s"))
+    span_seg = np.array([segment_of(0.5 * (a + b), cfg.cuts or []) for a, b in spans])
+    keep = np.isin(span_seg, seg_ids)          # spans in segments without events: start time unknown
+    spans, span_seg = spans[keep], span_seg[keep]
+    if not len(spans):
+        return np.zeros(len(surv), dtype=int)
+    T0_by_seg = {sg: surv[f"T0_s{sg}"].values for sg in seg_ids}
+    T0_span = np.stack([T0_by_seg[sg] for sg in span_seg], 1)   # (rows, spans)
     T0 = surv.T0.values
     event_fids = np.stack([surv[f"fid_{k}"].astype(str).values for k in range(n_events)], 1)
     viol = np.zeros(len(surv), dtype=int)
@@ -281,7 +333,7 @@ def silence_violations(surv: pd.DataFrame, n_events: int, tracks: dict[str, Trac
     order = np.argsort(inv, kind="stable")
     starts = np.searchsorted(inv[order], np.arange(len(ukeys)))
     ends = np.searchsorted(inv[order], np.arange(len(ukeys)), side="right")
-    t_lo, t_hi = T0.min() + spans[:, 0].min() - 60, T0.max() + spans[:, 1].max() + 60
+    t_lo, t_hi = np.nanmin(T0_span) + spans[:, 0].min() - 60, np.nanmax(T0_span) + spans[:, 1].max() + 60
     items = list(tracks.values())
     for n, tr in enumerate(items):
         if progress and n % 50 == 0:
@@ -306,8 +358,8 @@ def silence_violations(surv: pd.DataFrame, n_events: int, tracks: dict[str, Trac
             for r in rws:
                 if (event_fids[r] == tr.fid).any():
                     continue
-                a = hk - T0[r]
-                if np.any((a[:, None] >= spans[None, :, 0]) & (a[:, None] <= spans[None, :, 1])):
+                a = hk[:, None] - T0_span[r][None, :]
+                if np.any((a >= spans[None, :, 0]) & (a <= spans[None, :, 1])):
                     hit_rows.add(r)
         if hit_rows:
             viol[list(hit_rows)] += 1
@@ -319,8 +371,10 @@ def silence_violations(surv: pd.DataFrame, n_events: int, tracks: dict[str, Trac
 # ---------------------------------------------------------------------------
 
 class Scorer:
-    def __init__(self, spec: Spectrogram, events: list[Event], c: float, dt_sweep: float, f0_frac: float):
+    def __init__(self, spec: Spectrogram, events: list[Event], c: float, dt_sweep: float, f0_frac: float,
+                 cuts=()):
         self.spec = spec
+        self.segs = event_segments(events, list(cuts))
         # widen ridges by +/-1 bin so tiny model errors still land on the curve
         z = maximum_filter1d(spec.z, size=3, axis=0)
         self.spec_wide = Spectrogram(spec.t, spec.f, spec.db, z)
@@ -371,34 +425,48 @@ class Scorer:
         return best, bestf
 
     def score(self, tracks_per_event: list[Track], obs_xyz: np.ndarray):
-        """Joint score. Event 0 is swept in time; others are locked to it."""
-        curves = []
-        heard0 = None
-        for k, tr in enumerate(tracks_per_event):
+        """Joint score.
+
+        Within each uncut segment the first event is swept in time and the
+        others are locked to it by flight geometry. Different segments (split
+        by a cut) are swept independently - their start times are unrelated.
+        """
+        curves, heard = [], []
+        for tr in tracks_per_event:
             r = np.linalg.norm(tr.xyz - obs_xyz[None, :], axis=1)
             i = int(np.argmin(r))
-            t_emit = tr.t[i]
-            if k == 0:
-                heard0 = t_emit + r[i] / self.c
-            curves.append(self._curve(tr, obs_xyz, t_emit))
-        T0s = heard0 - (self.events[0].t_cpa + self.dts)
-        total = np.zeros(len(T0s))
-        per, perf = [], []
-        for k, (t_recv, f_rel) in enumerate(curves):
-            s, f = self._event_scores(k, T0s, t_recv, f_rel)
-            per.append(s)
-            perf.append(f)
-            total += s
-        j = int(np.argmax(total))
-        return {"score": float(total[j]) / len(curves), "T0": float(T0s[j]), "dt": float(self.dts[j]),
-                "event_scores": [float(p[j]) for p in per], "f0_best": [float(p[j]) for p in perf]}
+            heard.append(tr.t[i] + r[i] / self.c)
+            curves.append(self._curve(tr, obs_xyz, tr.t[i]))
+        n = len(curves)
+        ev_scores, ev_f0, ev_T0 = [0.0] * n, [0.0] * n, [0.0] * n
+        total, seg_T0, seg_dt = 0.0, {}, {}
+        for sg in sorted(set(self.segs)):
+            ks = [k for k in range(n) if self.segs[k] == sg]
+            ref = ks[0]
+            T0s = heard[ref] - (self.events[ref].t_cpa + self.dts)
+            tot = np.zeros(len(T0s))
+            per = {}
+            for k in ks:
+                sc, f = self._event_scores(k, T0s, *curves[k])
+                per[k] = (sc, f)
+                tot += sc
+            j = int(np.argmax(tot))
+            total += float(tot[j])
+            seg_T0[sg], seg_dt[sg] = float(T0s[j]), float(self.dts[j])
+            for k in ks:
+                ev_scores[k], ev_f0[k], ev_T0[k] = float(per[k][0][j]), float(per[k][1][j]), float(T0s[j])
+        s0 = self.segs[0]
+        return {"score": total / n, "T0": seg_T0[s0], "dt": seg_dt[s0], "T0_segs": seg_T0,
+                "T0_events": ev_T0, "event_scores": ev_scores, "f0_best": ev_f0}
 
     def model_curves(self, tracks_per_event, obs_xyz, T0, f0s):
+        """``T0`` may be one value or one per event (events in different segments)."""
+        T0s = np.broadcast_to(np.asarray(T0, dtype=float), (len(tracks_per_event),))
         out = []
         for k, tr in enumerate(tracks_per_event):
             r = np.linalg.norm(tr.xyz - obs_xyz[None, :], axis=1)
             t_recv, f_rel = self._curve(tr, obs_xyz, tr.t[int(np.argmin(r))], half=300)
-            out.append((t_recv - T0, f_rel * f0s[k]))
+            out.append((t_recv - T0s[k], f_rel * f0s[k]))
         return out
 
 
@@ -415,6 +483,28 @@ class SearchResult:
     survivors: pd.DataFrame
     tracks: dict
     log: list[str]
+    sites: pd.DataFrame | None = None   # distinct local maxima (incl. ambiguous alternatives)
+
+
+def distinct_sites(res: pd.DataFrame, combo_cols, min_sep_m: float = 750.0, limit: int = 300) -> pd.DataFrame:
+    """Greedy non-maximum suppression: best points that are at least
+    ``min_sep_m`` apart for the same flight combination. Shows ambiguous
+    alternatives (e.g. mirror positions when events are split by cuts)."""
+    from .geo import haversine_m
+
+    keep, kept_by_combo = [], {}
+    for i, r in enumerate(res.itertuples(index=False)):
+        key = tuple(getattr(r, c) for c in combo_cols)
+        prev = kept_by_combo.setdefault(key, [])
+        if all(haversine_m(r.lat, r.lon, a, b) >= min_sep_m for a, b in prev):
+            prev.append((r.lat, r.lon))
+            keep.append(i)
+            if len(keep) >= limit:
+                break
+    out = res.iloc[keep].reset_index(drop=True)
+    if len(out):
+        out["rel_score"] = out["score"] / out["score"].iloc[0]
+    return out
 
 
 def run_search(flights: pd.DataFrame, events: list[Event], spec: Spectrogram, cfg: SearchConfig, dem,
@@ -457,16 +547,22 @@ def run_search(flights: pd.DataFrame, events: list[Event], spec: Spectrogram, cf
             break
 
     if any(c.empty for c in cands) or len(cands) < len(events):
-        L("no candidates survived - widen the speed/distance ranges, time window or area")
+        bad = next((ev.name for ev, c in zip(events, cands) if c.empty), None)
+        L(f"no candidates for '{bad}': no flight in the data matches its speed/distance/time. If it is a false "
+          "detection, delete that event; otherwise widen its ranges, the time window or the area")
         empty = pd.DataFrame()
         return SearchResult(empty, empty, stages, cands, empty, tracks, log)
 
-    surv = combine_events(cands, events, cfg.offset_tol_s)
+    segs = event_segments(events, cfg.cuts)
+    if len(set(segs)) > 1:
+        L(f"events span {len(set(segs))} uncut segments {segs}: time offsets are only enforced "
+          "within a segment; each segment gets its own start time")
+    surv = combine_events(cands, events, cfg.offset_tol_s, segs, cfg.cut_removed_s)
     stages.append({"stage": "time-offset filter" if len(events) > 1 else "time window", "count": int(surv.key.nunique()) if len(surv) else 0})
     L(f"{len(surv)} rows / {surv.key.nunique() if len(surv) else 0} cells after time-offset filter")
 
     if cfg.silence and len(surv):
-        spans = cfg.clean_spans if cfg.clean_spans is not None else default_clean_spans(events, cfg.duration, cfg.silence_pad_s)
+        spans = cfg.clean_spans if cfg.clean_spans is not None else default_clean_spans(events, cfg.duration, cfg.silence_pad_s, cfg.cuts)
         L(f"silence spans (audio s): {[(round(a), round(b)) for a, b in spans]}")
         v = silence_violations(surv, len(events), tracks, cfg, spans, grid, dem, cache,
                                progress=lambda x: P(0.4 + 0.15 * x, "silence filter"))
@@ -493,7 +589,7 @@ def run_search(flights: pd.DataFrame, events: list[Event], spec: Spectrogram, cf
     else:
         surv_s = surv
 
-    scorer = Scorer(spec, events, cfg.c, cfg.dt_sweep_s, cfg.f0_sweep_frac)
+    scorer = Scorer(spec, events, cfg.c, cfg.dt_sweep_s, cfg.f0_sweep_frac, cfg.cuts)
     nr = int(round(cfg.grid_m / cfg.refine_m))
     offs = (np.arange(nr) - (nr - 1) / 2) * cfg.refine_m
     oe, on = [a.ravel() for a in np.meshgrid(offs, offs)]
@@ -510,8 +606,11 @@ def run_search(flights: pd.DataFrame, events: list[Event], spec: Spectrogram, cf
             r = scorer.score(trs, xyzs[p])
             rec = {"lat": float(sl[p]), "lon": float(so[p]), "elev": float(el[p]), "score": r["score"],
                    "T0": r["T0"], "dt": r["dt"], "cell": int(row.key)}
+            for sg, tv in r["T0_segs"].items():
+                rec[f"T0_s{sg}"] = tv
             for k in range(len(events)):
                 rec[f"score_{k}"] = r["event_scores"][k]
+                rec[f"T0_{k}"] = r["T0_events"][k]
                 rec[f"f0_{k}"] = r["f0_best"][k]
                 rec[f"fid_{k}"] = trs[k].fid
                 rec[f"callsign_{k}"] = trs[k].callsign
@@ -521,18 +620,22 @@ def run_search(flights: pd.DataFrame, events: list[Event], spec: Spectrogram, cf
             out.append(rec)
     res = pd.DataFrame(out).sort_values("score", ascending=False).reset_index(drop=True)
     res["start_utc"] = pd.to_datetime(res["T0"], unit="s", utc=True)
+    sg_cols = sorted(int(c[4:]) for c in res.columns if c.startswith("T0_s"))
+    for a, b in zip(sg_cols[:-1], sg_cols[1:]):
+        res[f"removed_s{a}_s{b}"] = res[f"T0_s{b}"] - res[f"T0_s{a}"]   # time cut out between segments
     combo = [f"fid_{k}" for k in range(len(events))]
     best = res.drop_duplicates(subset=combo, keep="first").reset_index(drop=True)
+    sites = distinct_sites(res, combo)
     stages.append({"stage": "Doppler-scored points", "count": len(res)})
     L(f"scored {len(res)} points across {len(best)} flight combinations in {_time.time() - t_start:.0f} s")
     P(1.0, "done")
-    return SearchResult(res, best, stages, cands, surv, tracks, log)
+    return SearchResult(res, best, stages, cands, surv, tracks, log, sites)
 
 
 def focus_heatmap(tracks_per_event: list[Track], events: list[Event], spec: Spectrogram, center, radius_m,
-                  step_m, dem, c=343.0, dt_sweep=4.0, f0_frac=0.03, progress=None) -> pd.DataFrame:
+                  step_m, dem, c=343.0, dt_sweep=4.0, f0_frac=0.03, progress=None, cuts=()) -> pd.DataFrame:
     """Score a fine grid around one location for a fixed flight combination."""
-    scorer = Scorer(spec, events, c, dt_sweep, f0_frac)
+    scorer = Scorer(spec, events, c, dt_sweep, f0_frac, cuts)
     offs = np.arange(-radius_m, radius_m + 1e-9, step_m)
     oe, on = [a.ravel() for a in np.meshgrid(offs, offs)]
     keep = oe**2 + on**2 <= radius_m**2

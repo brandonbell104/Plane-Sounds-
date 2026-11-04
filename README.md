@@ -74,6 +74,39 @@ recording date.
 * **Listen**: band-pass the audio, boost it and speed it up to confirm it really is an aircraft.
   A propeller sounds like a buzzing drone.
 
+### Cuts / edits (important for YouTube videos)
+Edited videos break the time gap between flyovers: two planes that look 3 minutes apart may really
+be hours apart. In **2 · Spectrogram → ✂️ Cuts / edits**:
+
+* **Detect cuts from audio** compares the *background noise floor* just before and just after
+  every instant. A cut usually changes the room tone, wind, distance or mic gain. Speech and
+  music bursts are ignored, because the detector uses a low percentile of the noise and not the
+  average. It also flags digital-silence gaps and hard sample splices. *Sensitivity* trades
+  missed cuts against false alarms.
+* **Detect cuts from video** downloads a low-res copy of the video and runs ffmpeg
+  scene-change detection. Each video cut also shows how much the audio changes there. A visual
+  cut with *audio may be continuous* is often b-roll laid over unbroken sound, so untick it if the
+  background noise really doesn't change.
+* Every cut appears as a dashed cyan **✂ marker** on all spectrograms. Untick false alarms in the
+  table, add cuts by hand, and save and load them together with your events.
+* Cuts divide the recording into **segments**. The search only enforces time offsets between
+  events in the **same** segment. Each segment gets its own unknown start time, and every
+  segment must agree on the location. By default, segments are assumed to be in chronological
+  order. If you have a rough idea of how much time a cut skips (e.g. "at most 10 minutes"),
+  enter it. Without that, each flight only fixes a *distance from its track*, so you will often
+  get a few near-tied candidate sites, and the results list them all. The results also estimate
+  **how much real time each cut removed** (`removed_s0_s1`).
+
+### Auto-detect flyovers
+**🔎 Scan whole recording** traces descending tonal ridges in every uncut segment and never
+traces across a cut. For each line in each window it tries several band hypotheses (approach
+plateau, recede plateau, middle), fits the Doppler model, and groups the lines that belong to the
+same aircraft (fundamental + harmonics). Good-quality detections are pre-ticked; weak ones are
+not. **➕ Add ticked detections as events** turns them into events with generous ranges,
+harmonics and scoring windows clipped at cuts. Always check them on the spectrogram: a single
+false event can make the search return nothing, and the log names the event that matched no
+flight.
+
 ### 3. Measure each event
 **Trace + fit** finds the brightest continuous, monotonically falling ridge inside your box and
 fits a straight-line Doppler model to it. This gives f₀, speed, CPA slant distance and CPA time.
@@ -174,8 +207,8 @@ python -m pytest -q tests
 * **Cost**: the candidate stages scale with (number of matching flights × area). A city-sized area
   takes seconds. A whole country for a whole day needs a big machine; the reference video used
   50 GB of data. Narrow the area and the time wherever you can.
-* **Edited videos**: cuts break the time offsets between events. Measure events only within one
-  continuous shot.
+* **Edited videos**: mark the cuts (see above). If an unmarked cut sits between two events, the
+  search enforces a wrong time offset and will usually find nothing, or the wrong place.
 * **Fair play**: this is a fun forensic technique. Use it on games and public footage, not to track
   people.
 
@@ -185,7 +218,8 @@ python -m pytest -q tests
 app.py                     Streamlit UI
 planesounds/audio.py       yt-dlp download, ffmpeg decode, band-pass "listen" helper
 planesounds/spectro.py     whitened high-resolution spectrograms, bilinear sampling
-planesounds/ridge.py       Viterbi ridge tracing, automatic candidate detection
+planesounds/ridge.py       Viterbi ridge tracing, automatic flyover detection (cut-aware)
+planesounds/cuts.py        audio + video cut detection, segments
 planesounds/doppler.py     Doppler physics (retarded time), straight-line fit, trajectory model
 planesounds/adsb.py        ADS-B loaders (readsb traces, adsb.lol, OpenSky, FR24, CSV)
 planesounds/aircraft_types.py  jet / prop / heli classification of ICAO type codes

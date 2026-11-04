@@ -1,7 +1,8 @@
 """Command-line interface.
 
     python -m planesounds fetch URL [-o out.wav]           download + decode audio
-    python -m planesounds detect FILE_OR_URL               list candidate Doppler curves
+    python -m planesounds cuts FILE_OR_URL [--video]       find edit points (audio, optionally video)
+    python -m planesounds detect FILE_OR_URL [--cuts 400 812]   list candidate Doppler curves
     python -m planesounds measure FILE_OR_URL --t0 --t1 --flo --fhi [--name] [--events events.json]
     python -m planesounds adsblol --day 2025-09-08 --bbox LATMIN LATMAX LONMIN LONMAX -o flights.parquet
     python -m planesounds search FILE_OR_URL --events events.json --flights flights.parquet \
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import adsb, audio, doppler, ridge, search, spectro, synth
+from . import adsb, audio, cuts as cutmod, doppler, ridge, search, spectro, synth
 from .dem import ConstantDEM, SRTMDEM
 from .geo import haversine_m
 
@@ -42,8 +43,16 @@ def main(argv=None):
     p.add_argument("-o", "--out", default="audio.wav")
     p.add_argument("--sr", type=int, default=8000)
 
+    p = sub.add_parser("cuts")
+    p.add_argument("src")
+    p.add_argument("--sr", type=int, default=8000)
+    p.add_argument("--sensitivity", type=float, default=1.0)
+    p.add_argument("--video", action="store_true", help="also run scene-cut detection on the video")
+    p.add_argument("--threshold", type=float, default=0.35)
+
     p = sub.add_parser("detect")
     p.add_argument("src")
+    p.add_argument("--cuts", type=float, nargs="*", default=[])
     p.add_argument("--sr", type=int, default=8000)
     p.add_argument("--fmax", type=float, default=700)
 
@@ -75,6 +84,8 @@ def main(argv=None):
     p.add_argument("--elev", type=float, default=0.0, help="constant ground elevation (m)")
     p.add_argument("--srtm", action="store_true", help="use SRTM elevation (auto-download)")
     p.add_argument("--no-silence", action="store_true")
+    p.add_argument("--cuts", type=float, nargs="*", default=[], help="audio times of edits")
+    p.add_argument("--max-removed", type=float, default=None, help="max seconds removed at each cut")
     p.add_argument("--temp", type=float, default=15.0)
     p.add_argument("--sr", type=int, default=8000)
     p.add_argument("-o", "--out", default="results.csv")
@@ -87,11 +98,23 @@ def main(argv=None):
         audio.write_wav(a.out, x.samples, x.sr)
         print(f"wrote {a.out} ({x.duration:.1f} s) - {x.title} uploaded {x.upload_date}")
 
+    elif a.cmd == "cuts":
+        x = audio.load_source(a.src, a.sr)
+        found = cutmod.detect_audio_cuts(x.samples, x.sr, a.sensitivity)
+        if a.video:
+            vp = audio.download_video_lowres(a.src) if a.src.startswith("http") else a.src
+            vc = cutmod.annotate_with_audio(cutmod.detect_video_cuts(vp, a.threshold), x.samples, x.sr)
+            found = cutmod.merge_cuts(found, vc)
+        for c in found:
+            print(f"{c.t:9.2f} s  {c.source:<12} strength {c.strength:6.1f}  {c.note}")
+        print("--cuts " + " ".join(f"{c.t:.2f}" for c in found))
+
     elif a.cmd == "detect":
         x = audio.load_source(a.src, a.sr)
         s = spectro.compute(x.samples, x.sr, f_max=min(a.fmax + 50, x.sr / 2))
-        for d in ridge.detect_candidates(s, f_hi=a.fmax):
-            print(f"CPA {d['t_cpa']:8.1f} s  f0 {d['f0']:7.1f} Hz  v {d['v']:5.1f} m/s  d {d['d']:6.0f} m  "
+        for d in sorted(ridge.detect_candidates(s, cuts=a.cuts, f_hi=a.fmax), key=lambda d: d["t_cpa"]):
+            print(f"{'OK  ' if d['good'] else 'weak'} seg {d['segment']}  CPA {d['t_cpa']:8.1f} s  f0 {d['f0']:7.1f} Hz  "
+                  f"v {d['v']:5.1f} m/s  d {d['d']:6.0f} m  lines {d['lines']}  "
                   f"box {d['t0']:.0f}-{d['t1']:.0f}s {d['f_lo']:.0f}-{d['f_hi']:.0f}Hz")
 
     elif a.cmd == "measure":
@@ -125,13 +148,14 @@ def main(argv=None):
         s = spectro.compute(x.samples, x.sr, f_max=min(fmax, x.sr / 2))
         cfg = search.SearchConfig(bbox=tuple(a.bbox), t0_range=(_ts(a.start), _ts(a.end)), duration=x.duration,
                                   grid_m=a.grid, refine_m=a.refine, offset_tol_s=a.tol,
-                                  c=doppler.speed_of_sound(a.temp), silence=not a.no_silence)
+                                  c=doppler.speed_of_sound(a.temp), silence=not a.no_silence, cuts=a.cuts,
+                                  cut_removed_s=(0.0, a.max_removed))
         dem = SRTMDEM(fallback=a.elev) if a.srtm else ConstantDEM(a.elev)
         res = search.run_search(fl, evs, s, cfg, dem, progress=_progress)
         print("\n" + "\n".join(res.log))
         if not res.results.empty:
             res.results.to_csv(a.out, index=False)
-            print(res.best_per_combo.head(10)[["lat", "lon", "score", "start_utc"]].to_string())
+            print(res.sites.head(10)[["lat", "lon", "score", "rel_score", "start_utc"]].to_string())
             print(f"full results -> {a.out}")
 
     elif a.cmd == "demo":
