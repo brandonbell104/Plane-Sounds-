@@ -58,14 +58,21 @@ class Spectrogram:
 
 def compute(x: np.ndarray, sr: int, f_max: float = 1000.0, f_min: float = 0.0,
             win_s: float = 1.0, hop_s: float = 0.25, whiten: str = "freq",
-            t_offset: float = 0.0, oversample: int = 2) -> Spectrogram:
+            t_offset: float = 0.0, oversample: int = 2, segments=None, local_s: float = 120.0) -> Spectrogram:
     """STFT power spectrogram.
 
     * ``win_s`` controls frequency resolution (1 s -> 1 Hz bins). Doppler tones
       from propellers are narrow, so long windows dramatically improve SNR.
-    * ``whiten='freq'`` subtracts each frequency's median level (kills constant
-      hum, mains lines and the steep low-frequency noise slope); ``'both'``
-      additionally removes broadband clicks/transients per frame.
+    * ``whiten``:
+        - ``'freq'``  subtract each frequency's median level (kills constant hum,
+          mains lines and the steep low-frequency noise slope);
+        - ``'local'`` same, but using a *rolling* level (~``local_s`` seconds, default 2 min), so
+          quiet and loud stretches of a recording are both readable;
+        - ``'both'``  ``'freq'`` + removal of broadband clicks per frame;
+        - ``'none'``.
+    * ``segments``: list of (t0, t1) uncut segments (audio clock). Whitening and
+      contrast are then computed separately per segment, so a cut to a louder or
+      quieter scene doesn't black out / blow out the other parts.
     """
     nper = max(16, int(round(win_s * sr)))
     hop = max(1, int(round(hop_s * sr)))
@@ -75,20 +82,63 @@ def compute(x: np.ndarray, sr: int, f_max: float = 1000.0, f_min: float = 0.0,
     band = (f >= f_min) & (f <= f_max)
     p = np.abs(Z[band]) ** 2
     db = 10 * np.log10(p + 1e-14)
-    z = whiten_db(db, whiten)
-    return Spectrogram(t + t_offset, f[band], db.astype(np.float32), z.astype(np.float32))
+    tt = t + t_offset
+    z = whiten_db(db, whiten, tt, segments, hop_s, local_s)
+    return Spectrogram(tt, f[band], db.astype(np.float32), z.astype(np.float32))
 
 
-def whiten_db(db: np.ndarray, mode: str = "freq") -> np.ndarray:
+def _segment_masks(frame_t, segments):
+    if frame_t is None or not segments:
+        return None
+    masks = []
+    for a, b in segments:
+        m = (frame_t >= a) & (frame_t < b)
+        if m.sum() >= 3:
+            masks.append(m)
+    covered = np.zeros(len(frame_t), bool)
+    for m in masks:
+        covered |= m
+    if (~covered).any():
+        masks.append(~covered)
+    return masks if len(masks) > 1 else None
+
+
+def _rolling_level(z: np.ndarray, hop_s: float, local_s: float) -> np.ndarray:
+    """Per-frequency background level that follows slow changes (block medians,
+    then a running median over ~local_s seconds). Cheap even for hours of audio."""
+    n = z.shape[1]
+    blk = max(1, int(round(5.0 / max(hop_s, 1e-3))))
+    nb = int(np.ceil(n / blk))
+    pad = nb * blk - n
+    zz = np.pad(z, ((0, 0), (0, pad)), mode="edge") if pad else z
+    bm = np.median(zz.reshape(z.shape[0], nb, blk), axis=2)
+    k = max(1, int(round(local_s / 5.0)) | 1)
+    if nb > 1 and k > 1:
+        bm = median_filter(bm, size=(1, min(k, nb if nb % 2 else nb - 1 or 1)), mode="nearest")
+    centers = (np.arange(nb) + 0.5) * blk
+    idx = np.arange(n)
+    return np.stack([np.interp(idx, centers, row) for row in bm])
+
+
+def whiten_db(db: np.ndarray, mode: str = "freq", frame_t=None, segments=None, hop_s=None,
+              local_s: float = 60.0) -> np.ndarray:
     z = db.copy()
-    if mode in ("freq", "both"):
-        z -= np.median(z, axis=1, keepdims=True)
-    if mode in ("time", "both"):
-        # remove broadband per-frame level using a local spectral median
-        z -= median_filter(z, size=(31, 1), mode="nearest")
-    # robust scale -> roughly "sigmas above the noise floor"
-    mad = np.median(np.abs(z - np.median(z))) * 1.4826 + 1e-9
-    z = (z - np.median(z)) / mad
+    masks = _segment_masks(frame_t, segments)
+    parts = masks if masks is not None else [np.ones(z.shape[1], bool)]
+    for m in parts:
+        zs = z[:, m]
+        if mode in ("freq", "both"):
+            zs = zs - np.median(zs, axis=1, keepdims=True)
+        elif mode == "local":
+            h = hop_s if hop_s else 0.25
+            zs = zs - _rolling_level(zs, h, local_s)
+        if mode in ("time", "both"):
+            # remove broadband per-frame level using a local spectral median
+            zs = zs - median_filter(zs, size=(31, 1), mode="nearest")
+        # robust scale -> roughly "sigmas above the noise floor" (per segment)
+        med = np.median(zs)
+        mad = np.median(np.abs(zs - med)) * 1.4826 + 1e-9
+        z[:, m] = (zs - med) / mad
     return np.clip(z, 0, None)
 
 

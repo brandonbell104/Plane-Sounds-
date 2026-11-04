@@ -25,6 +25,8 @@ for k, v in {"audio": None, "events": [], "sel": None, "trace": None, "fit": Non
     S.setdefault(k, v)
 
 UTC = dt.timezone.utc
+# max (time columns, frequency rows) sent to the browser per spectrogram
+DETAIL = {"Standard": (1400, 500), "High": (2400, 800), "Very high": (4000, 1200)}
 # explicit rgb() stops: the Streamlit frontend re-maps some named/hex scale colours
 SPEC_CMAP = [[i / 8, f"rgb({r},{g},{b})"] for i, (r, g, b) in enumerate([
     (2, 2, 8), (20, 14, 54), (59, 15, 112), (100, 26, 128), (140, 41, 129),
@@ -35,10 +37,12 @@ SPEC_CMAP = [[i / 8, f"rgb({r},{g},{b})"] for i, (r, g, b) in enumerate([
 # helpers
 # ---------------------------------------------------------------------------
 
-def get_spec(win_s, hop_s, f_max, whiten, t0=None, t1=None, f_min=0.0):
+def get_spec(win_s, hop_s, f_max, whiten, t0=None, t1=None, f_min=0.0, oversample=2):
     a = S.audio
+    segs = tuple(seg_bounds()) if S.cuts else None
     key = (id(a), round(win_s, 3), round(hop_s, 3), round(f_max), whiten,
-           None if t0 is None else round(t0, 1), None if t1 is None else round(t1, 1), round(f_min))
+           None if t0 is None else round(t0, 1), None if t1 is None else round(t1, 1), round(f_min),
+           oversample, segs)
     cache = S.spec_cache
     if key not in cache:
         if len(cache) > 12:
@@ -46,11 +50,12 @@ def get_spec(win_s, hop_s, f_max, whiten, t0=None, t1=None, f_min=0.0):
         if t0 is None:
             x, off = a.samples, 0.0
         else:
-            pad = win_s
+            pad = max(win_s, 30.0)   # extra context so background estimates have no edge effects
             lo = max(0.0, t0 - pad)
             x, off = a.segment(lo, t1 + pad), lo
         cache[key] = spectro.compute(x, a.sr, f_max=f_max, f_min=f_min, win_s=win_s, hop_s=hop_s,
-                                     whiten=whiten, t_offset=off)
+                                     whiten=whiten, t_offset=off, oversample=oversample,
+                                     segments=list(segs) if segs else None)
     return cache[key]
 
 
@@ -80,10 +85,12 @@ def add_cut_markers(fig, t_lo, t_hi):
 
 def spec_figure(s: spectro.Spectrogram, title="", zmax=None, overlays=(), height=460, field="z",
                 selectable=False, show_cuts=True):
-    tt, ff, img = spectro.downsample_for_display(s, 1400, 500, field)
+    mt, mf = DETAIL.get(S.get("disp_detail", "High"), (2400, 800))
+    tt, ff, img = spectro.downsample_for_display(s, mt, mf, field)
     if zmax is None:
         zmax = float(np.percentile(img, 99.5)) if img.size else 1
     fig = go.Figure(go.Heatmap(x=tt, y=ff, z=img, colorscale=SPEC_CMAP, zmin=0 if field == "z" else None,
+                               zsmooth="best" if S.get("disp_smooth", True) else False,
                                zmax=zmax, colorbar=dict(title="σ" if field == "z" else "dB"),
                                hovertemplate="t=%{x:.2f}s<br>f=%{y:.2f}Hz<br>%{z:.2f}<extra></extra>"))
     for ov in overlays:
@@ -129,6 +136,12 @@ with st.sidebar:
     st.number_input("Air temperature (°C)", -40.0, 50.0, 15.0, 1.0, key="temp_c",
                     help="Sets the speed of sound. Use the local temperature at recording time if known.")
     st.caption(f"speed of sound ≈ {c_sound():.1f} m/s")
+    st.divider()
+    st.subheader("Display")
+    st.select_slider("Spectrogram detail", list(DETAIL), "High", key="disp_detail",
+                     help="How many pixels are sent to the browser. 'Very high' is sharper but slower to draw.")
+    st.checkbox("Smooth pixels", True, key="disp_smooth",
+                help="Interpolate between pixels instead of drawing hard blocks")
     st.divider()
     st.subheader("Session")
     if S.events or S.cuts:
@@ -235,17 +248,41 @@ with tabs[1]:
         with st.expander("Overview (whole recording)", expanded=True):
             oc = st.columns(4)
             ov_fmax = oc[0].number_input("Max freq (Hz)", 50.0, a.sr / 2, min(1000.0, a.sr / 2), 50.0, key="ov_fmax")
-            ov_win = oc[1].select_slider("Window (s)", [0.25, 0.5, 1.0, 2.0], 0.5, key="ov_win")
-            ov_hop = oc[2].select_slider("Hop (s)", [0.25, 0.5, 1.0, 2.0], 1.0, key="ov_hop")
-            ov_wh = oc[3].selectbox("Whitening", ["freq", "both", "none"], 0, key="ov_wh",
-                                    help="'freq' removes constant hum per frequency; 'both' also removes broadband bursts")
+            ov_win = oc[1].select_slider("Window (s)", [0.25, 0.5, 1.0, 2.0, 4.0], 1.0, key="ov_win",
+                                         help="Sets frequency sharpness: 1 s -> 1 Hz, 2 s -> 0.5 Hz. Short windows "
+                                              "make tall vertical blocks.")
+            ov_hop = oc[2].select_slider("Hop (s)", [0.1, 0.25, 0.5, 1.0, 2.0], 0.5, key="ov_hop",
+                                         help="Time step between columns (smaller = finer time detail, slower)")
+            ov_wh = oc[3].selectbox("Whitening", ["local", "freq", "both", "none"], 0, key="ov_wh",
+                                    help="'local' normalises against the background of the surrounding minute, so "
+                                         "quiet and loud parts are both readable. 'freq' uses one level for the whole "
+                                         "recording (or per segment if cuts are marked). 'both' also removes clicks.")
             so = get_spec(ov_win, ov_hop, ov_fmax, ov_wh)
+            mt, _ = DETAIL[S.get("disp_detail", "High")]
+            col_s = max(ov_hop, a.duration / mt)
+            st.caption(f"Resolution: {1 / ov_win:.2f} Hz × {col_s:.2f} s per pixel. "
+                       "**Drag a box on this chart** to open that region in the full-resolution Zoom view below "
+                       "(the mouse-wheel/zoom tool only magnifies the overview's pixels).")
             ov_ovl = []
             for d in (S.detected or []):
                 ov_ovl.append(line(d["trace_t"], d["trace_f"], f"#{d['id']} CPA {d['t_cpa']:.0f}s", "#76ff03",
                                    width=3))
-            st.plotly_chart(spec_figure(so, "Whole recording - dashed cyan lines = cuts, green = detected flyovers",
-                                        overlays=ov_ovl, height=400), width="stretch", theme=None)
+            ov_ev = st.plotly_chart(spec_figure(so, "Whole recording - dashed cyan = cuts, green = detected flyovers",
+                                                overlays=ov_ovl, height=400, selectable=True),
+                                    width="stretch", theme=None, on_select="rerun", selection_mode=("box",),
+                                    key="ov_chart")
+            try:
+                ob = ov_ev["selection"]["box"][0] if ov_ev and ov_ev["selection"].get("box") else None
+            except Exception:
+                ob = None
+            if ob:
+                bx = (tuple(sorted(ob["x"])), tuple(sorted(ob["y"])))
+                if bx != S.get("ov_box_last"):
+                    S.ov_box_last = bx
+                    (x0, x1), (y0, y1) = bx
+                    S.sel = {"t0": max(0.0, x0), "t1": min(a.duration, max(x1, x0 + 5)),
+                             "f0": max(0.0, y0), "f1": max(y1, y0 + 5)}
+                    st.toast(f"Opened {x0:.0f}-{x1:.0f} s, {y0:.0f}-{y1:.0f} Hz in the Zoom view below")
 
         # ------------------------------------------------------------ cuts
         st.subheader("✂️ Cuts / edits")
@@ -377,12 +414,16 @@ with tabs[1]:
         z_t1 = zc[1].number_input("t to", 0.0, a.duration, float(sel["t1"]), 1.0)
         z_f0 = zc[2].number_input("f from", 0.0, a.sr / 2, float(sel["f0"]), 1.0)
         z_f1 = zc[3].number_input("f to", 0.0, a.sr / 2, float(sel["f1"]), 1.0)
-        z_win = zc[4].select_slider("Window (s)", [0.5, 1.0, 2.0, 3.0, 4.0], 1.0,
+        z_win = zc[4].select_slider("Window (s)", [0.25, 0.5, 1.0, 2.0, 3.0, 4.0], 1.0,
                                     help="Longer = sharper frequency, blurrier time. 1-2 s works well for props.")
         z_c = zc[5].slider("Contrast", 0.2, 3.0, 1.0, 0.1)
         S.sel = {"t0": z_t0, "t1": max(z_t1, z_t0 + 5), "f0": z_f0, "f1": max(z_f1, z_f0 + 5)}
-        sz = get_spec(z_win, z_win / 4, S.sel["f1"] + 5, "freq", S.sel["t0"], S.sel["t1"], max(0, S.sel["f0"] - 5))
+        z_hop = max(z_win / 8, (S.sel["t1"] - S.sel["t0"]) / 4000)
+        sz = get_spec(z_win, z_hop, S.sel["f1"] + 5, S.get("ov_wh", "local"), S.sel["t0"], S.sel["t1"],
+                      max(0, S.sel["f0"] - 5), oversample=4)
         sz = sz.crop(S.sel["t0"], S.sel["t1"], S.sel["f0"], S.sel["f1"])
+        st.caption(f"Full resolution: {1 / z_win:.2f} Hz frequency resolution, {z_hop:.2f} s time step "
+                   f"(whitening: {S.get('ov_wh', 'local')}).")
         zmax = float(np.percentile(sz.z, 99.5) / z_c) if sz.z.size else 1
         ov = []
         if S.trace is not None:
