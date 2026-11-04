@@ -1,0 +1,9 @@
+[server]
+maxUploadSize = 4000
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
