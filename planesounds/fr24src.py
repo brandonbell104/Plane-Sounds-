@@ -144,7 +144,7 @@ async def discover(fr, bbox, t_lo: float, t_hi: float, step_s: float = 300, limi
             b, depth = queue.pop()
             fp = snap_dir / f"{int(ts)}_{b[0]}_{b[1]}_{b[2]}_{b[3]}.json"
             if fp.exists():
-                recs = json.loads(fp.read_text())
+                recs = json.loads(fp.read_text(encoding="utf-8"))
             else:
                 try:
                     recs = await _with_retry(lambda: _snapshot(fr, b, int(ts), limit))
@@ -155,7 +155,7 @@ async def discover(fr, bbox, t_lo: float, t_hi: float, step_s: float = 300, limi
                     if stats.snapshots == 0 and len(stats.errors) >= 3:   # nothing works: stop early
                         raise FR24Error(f"could not reach Flightradar24 - {stats.errors[0]}")
                     continue
-                fp.write_text(json.dumps(recs, default=str))
+                fp.write_text(json.dumps(recs, default=str), encoding="utf-8")
                 await asyncio.sleep(delay_s)
             stats.snapshots += 1
             if len(recs) >= 0.95 * limit and depth < 5:
@@ -222,14 +222,14 @@ async def download_tracks(fr, seen: dict[int, dict], skip_jets: bool = False, de
         fp = tdir / f"{fid:x}.json"
         d = None
         if fp.exists():
-            d = json.loads(fp.read_text())
+            d = json.loads(fp.read_text(encoding="utf-8"))
             stats.tracks_cached += 1
         else:
             try:
                 d = await _with_retry(lambda: _playback(fr, fid, None))
                 if _track_rows(d, fid, info) is None:   # retry with the time we saw it
                     d = await _with_retry(lambda: _playback(fr, fid, info["first_seen"]))
-                fp.write_text(json.dumps(d, default=str))
+                fp.write_text(json.dumps(d, default=str), encoding="utf-8")
                 stats.tracks_downloaded += 1
                 await asyncio.sleep(delay_s)
             except Exception as ex:

@@ -75,7 +75,7 @@ def download_youtube(url: str, cache_dir: Path = CACHE_DIR, progress=None) -> tu
     key = hashlib.sha1(url.strip().encode()).hexdigest()[:16]
     meta_path = cache_dir / f"{key}.json"
     if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
         p = Path(meta.get("_file", ""))
         if p.exists():
             return p, meta
@@ -107,7 +107,7 @@ def download_youtube(url: str, cache_dir: Path = CACHE_DIR, progress=None) -> tu
                                       "release_timestamp", "duration", "description",
                                       "webpage_url", "location", "is_live", "was_live")}
     keep["_file"] = str(fname)
-    meta_path.write_text(json.dumps(keep, default=str))
+    meta_path.write_text(json.dumps(keep, default=str), encoding="utf-8")
     return fname, keep
 
 

@@ -144,7 +144,7 @@ def detect_video_cuts(video_path: str | Path, threshold: float = 0.35, t_offset:
         raise RuntimeError("ffmpeg not found on PATH")
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-i", str(video_path), "-an", "-vf",
            f"scale=160:-2,select='gt(scene,{threshold})',metadata=print", "-f", "null", "-"]
-    out = subprocess.run(cmd, capture_output=True, text=True, errors="ignore")
+    out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
     if out.returncode != 0 and "pts_time" not in out.stderr:
         raise RuntimeError(f"ffmpeg scene detection failed: {out.stderr[-400:]}")
     cuts, t_cur = [], None

@@ -932,4 +932,4 @@ with tabs[5]:
 # 7. docs
 # ---------------------------------------------------------------------------
 with tabs[6]:
-    st.markdown(Path(__file__).with_name("README.md").read_text() if Path(__file__).with_name("README.md").exists() else "")
+    st.markdown(Path(__file__).with_name("README.md").read_text(encoding="utf-8") if Path(__file__).with_name("README.md").exists() else "")

@@ -125,12 +125,12 @@ def main(argv=None):
         fit = doppler.fit_linear(t, f, c, weights=st)
         rg = fit.ranges()
         evp = Path(a.events)
-        evs = json.loads(evp.read_text())["events"] if evp.exists() else []
+        evs = json.loads(evp.read_text(encoding="utf-8"))["events"] if evp.exists() else []
         e = search.Event(name=a.name or f"event {len(evs) + 1}", t_cpa=fit.t_cpa, f0=fit.f0, v_range=rg["v"],
                          d_range=rg["d"], t_window=(fit.t_cpa - a.window, fit.t_cpa + a.window),
                          f_band=(a.flo, a.fhi), trace_t=list(t), trace_f=list(f))
         evs.append(e.to_dict())
-        evp.write_text(json.dumps({"events": sorted(evs, key=lambda d: d["t_cpa"])}, indent=1))
+        evp.write_text(json.dumps({"events": sorted(evs, key=lambda d: d["t_cpa"])}, indent=1), encoding="utf-8")
         print(f"f0={fit.f0:.2f} Hz v={fit.v:.1f} m/s d={fit.d:.0f} m CPA={fit.t_cpa:.2f}s rms={fit.rms_hz:.2f} Hz"
               f" -> saved to {evp}")
 
@@ -141,7 +141,7 @@ def main(argv=None):
 
     elif a.cmd == "search":
         x = audio.load_source(a.src, a.sr)
-        evs = [search.Event(**e) for e in json.loads(Path(a.events).read_text())["events"]]
+        evs = [search.Event(**e) for e in json.loads(Path(a.events).read_text(encoding="utf-8"))["events"]]
         fl = pd.concat([adsb.load_table(p) if not Path(p).is_dir() else adsb.load_readsb_traces([p], tuple(a.bbox))
                         for p in a.flights], ignore_index=True)
         fmax = max(e.f_band[1] * max(e.harmonics) for e in evs) * 1.1 + 10
