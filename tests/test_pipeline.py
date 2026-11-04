@@ -143,3 +143,66 @@ def test_search_across_a_cut():
     assert haversine_m(o[0], o[1], top.lat, top.lon) < 400, res.log
     assert abs(top.T0_s0 - sc["rec_start"]) < 3                    # segment 0 starts at the real start
     assert abs(top.removed_s0_s1 - 500) < 4                        # recovers how much time was cut out
+
+
+def test_fr24_scrape_with_fake_server(tmp_path, monkeypatch):
+    """Discovery (incl. tile splitting when a snapshot is full) + full-track download,
+    against a fake Flightradar24 client built from the synthetic demo flights."""
+    from planesounds import fr24src
+    sc = synth.demo_scenario()
+    fl = sc["flights"]
+    ids = {fid: 0x30000000 + i for i, fid in enumerate(fl.flight_id.unique())}
+    monkeypatch.setattr(fr24src, "CACHE", tmp_path)
+    monkeypatch.setattr(fr24src, "snapshot_records", lambda res: res)
+    calls = {"snap": 0, "pb": 0}
+
+    class Res:
+        def __init__(self, d):
+            self.d = d
+        def to_dict(self):
+            return self.d
+
+    class Snap:
+        async def fetch(self, bb, timestamp, duration, limit):
+            calls["snap"] += 1
+            s, n, w, e = bb
+            g = fl[(abs(fl.time - timestamp) < 3) & fl.lat.between(s, n) & fl.lon.between(w, e)]
+            g = g.drop_duplicates("flight_id")
+            return [{"flightid": ids[r.flight_id], "callsign": r.callsign, "typecode": r.typecode,
+                     "registration": "", "timestamp": int(r.time * 1000)} for r in g.itertuples()][:limit]
+
+    class PB:
+        async def fetch(self, flight_id, timestamp=None):
+            calls["pb"] += 1
+            fid = next(k for k, v in ids.items() if v == flight_id)
+            g = fl[fl.flight_id == fid]
+            track = [{"timestamp": int(r.time), "latitude": r.lat, "longitude": r.lon,
+                      "altitude": {"feet": r.alt_m / 0.3048}, "speed": {"kts": r.gs_ms / 0.514444}}
+                     for r in g.itertuples()]
+            return Res({"result": {"response": {"data": {"flight": {
+                "track": track, "identification": {"callsign": g.callsign.iloc[0]},
+                "aircraft": {"model": {"code": g.typecode.iloc[0]},
+                             "identification": {"modes": g.icao24.iloc[0]}}}}}}})
+
+    class FakeFR24:
+        live_feed_playback = Snap()
+        playback = PB()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+
+    o = sc["obs"]
+    bbox = (o[0] - 0.4, o[0] + 0.4, o[1] - 0.5, o[1] + 0.5)
+    t_lo, t_hi = sc["rec_start"] - 600, sc["rec_start"] + 1500
+    # flights are sampled every 5 s in the synthetic data: use 5 s snapshot step; limit=3 forces tiling
+    df, stats = fr24src.scrape(bbox, t_lo, t_hi, step_s=5, delay_s=0, client_factory=FakeFR24, limit=3)
+    assert stats.tiles_split > 0 and stats.tracks_failed == 0
+    got = set(df.icao24)
+    assert {"a1b2c3", "d4e5f6"} <= got
+    a = df[df.icao24 == "a1b2c3"]
+    assert a.typecode.iloc[0] == "PA28" and a.propulsion.iloc[0] == "prop" and len(a) > 100
+    # second run is served from the on-disk cache
+    n_pb = calls["pb"]
+    df2, stats2 = fr24src.scrape(bbox, t_lo, t_hi, step_s=5, delay_s=0, client_factory=FakeFR24, limit=3)
+    assert calls["pb"] == n_pb and stats2.tracks_cached == stats.tracks_downloaded

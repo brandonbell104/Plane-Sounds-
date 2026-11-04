@@ -124,6 +124,15 @@ The manual sliders let you check the fit by eye, like in the video. Before savin
 * **Time**: the possible range for *audio t = 0* in **UTC**. A known day works with two or more
   events. A known exact time (± a few minutes) can be enough with a single event.
 * **ADS-B data** (one row per position report). Options:
+  * **Flightradar24 (fr24 scraper)**: this is the "Python package to scrape the data" route
+    from the video, using the open-source [`fr24`](https://github.com/cathaypacific8747/fr24)
+    package. It works on **historical** data. It replays FR24's feed for your area every few
+    minutes across the time window to find every aircraft that was there, then downloads each
+    one's **entire flight path**. Dense areas are split into tiles automatically, and everything
+    is cached in `~/.planesounds/fr24`, so interrupted runs resume. How far back you can go
+    depends on your FR24 account: anonymous or free access covers roughly the last week, and paid
+    plans cover months to years. You can enter an FR24 login; it is never saved. The package is
+    unofficial, so keep the request rate low and use it for personal projects.
   * **adsb.lol archive (auto)**: streams one UTC day of the free community
     [`globe_history`](https://github.com/adsblol) dump (several GB) from GitHub, keeps only your
     area and saves a small parquet under `~/.planesounds/adsb/`. Set a `GITHUB_TOKEN`
@@ -221,7 +230,8 @@ planesounds/spectro.py     whitened high-resolution spectrograms, bilinear sampl
 planesounds/ridge.py       Viterbi ridge tracing, automatic flyover detection (cut-aware)
 planesounds/cuts.py        audio + video cut detection, segments
 planesounds/doppler.py     Doppler physics (retarded time), straight-line fit, trajectory model
-planesounds/adsb.py        ADS-B loaders (readsb traces, adsb.lol, OpenSky, FR24, CSV)
+planesounds/adsb.py        ADS-B loaders (readsb traces, adsb.lol, OpenSky, FR24 CSV, CSV)
+planesounds/fr24src.py     Flightradar24 historical scraper (fr24 package)
 planesounds/aircraft_types.py  jet / prop / heli classification of ICAO type codes
 planesounds/dem.py         ground elevation: constant or SRTM tiles (auto-download)
 planesounds/geo.py         WGS84/ECEF, global integer grid

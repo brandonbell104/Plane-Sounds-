@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
 
-from planesounds import adsb, audio as au, cuts as cutmod, doppler, ridge, search, spectro, synth
+from planesounds import adsb, audio as au, cuts as cutmod, doppler, fr24src, ridge, search, spectro, synth
 from planesounds.dem import ConstantDEM, SRTMDEM
 from planesounds.geo import haversine_m, lla_to_ecef
 
@@ -595,9 +595,55 @@ with tabs[3]:
     st.caption(f"Audio t=0 between {fmt_utc(S.t0_range[0])} and {fmt_utc(S.t0_range[1])}")
 
     st.header("Flight (ADS-B) data")
-    src = st.radio("Source", ["Local files / folder", "Upload", "adsb.lol daily archive (auto-download)",
-                              "OpenSky (Trino, needs account)"], horizontal=True)
-    if src == "Local files / folder":
+    src = st.radio("Source", ["Flightradar24 (fr24 scraper, historical)", "adsb.lol daily archive (auto-download)",
+                              "Local files / folder", "Upload", "OpenSky (Trino, needs account)"], horizontal=True)
+    if src.startswith("Flightradar24"):
+        st.markdown(
+            "Uses the open-source [`fr24`](https://github.com/cathaypacific8747/fr24) Python package - the "
+            "*'Python package to scrape the data'* route from the video. It is **historical**: it replays FR24's "
+            "feed for your area every few minutes in the time window to find every aircraft, then downloads each "
+            "one's **entire flight path**. Results are cached in `~/.planesounds/fr24`, so an interrupted run resumes.")
+        st.caption("How far back you can go depends on your FR24 account (anonymous/free: roughly the last week; "
+                   "paid plans: months to years). It's unofficial - keep the rate low and use it for personal fun.")
+        audio_len = S.audio.duration if S.audio is not None else 1800.0
+        f_lo = S.t0_range[0] - 900
+        f_hi = S.t0_range[1] + audio_len + 900
+        fc = st.columns(4)
+        step_min = fc[0].number_input("Snapshot every (min)", 1.0, 30.0, 5.0, 1.0,
+                                      help="Shorter catches fast aircraft that cross the area quickly; more requests")
+        skip_jets = fc[1].checkbox("Skip jets", False,
+                                   help="Much faster in busy airspace, but the silence filter can then only "
+                                        "use propeller traffic")
+        delay = fc[2].number_input("Pause between requests (s)", 0.0, 10.0, 0.6, 0.1)
+        n_snap = int((f_hi - f_lo) / (step_min * 60)) + 1
+        fc[3].metric("Snapshots to fetch", f"{n_snap:,}")
+        with st.expander("Optional FR24 login (for older data)"):
+            fu = st.text_input("FR24 email", key="fr24_user")
+            fp = st.text_input("FR24 password", type="password", key="fr24_pw")
+            st.caption("Used only for this download, sent only to Flightradar24 and never saved. You can instead set "
+                       "the environment variables the fr24 package reads (see its docs).")
+        st.caption(f"Window: {fmt_utc(f_lo)} → {fmt_utc(f_hi)} (your recording-start range + audio length "
+                   "+ 15 min each side). Narrow the time range in the section above to make this much faster.")
+        if (f_hi - f_lo) > 36 * 3600:
+            st.warning("That's more than 36 h of snapshots - narrow the time window first.")
+        if not fr24src.available():
+            st.error("The `fr24` package isn't installed. Run: `pip install \"fr24[curl]\"` then restart the app.")
+        elif st.button("⬇️ Scrape Flightradar24", type="primary"):
+            bar = st.progress(0.0, "starting")
+            bbox = (ar["lat_min"], ar["lat_max"], ar["lon_min"], ar["lon_max"])
+            outp = adsb.DATA_DIR / f"fr24_{int(f_lo)}_{int(f_hi)}_{bbox[0]:.2f}_{bbox[1]:.2f}_{bbox[2]:.2f}_{bbox[3]:.2f}.parquet"
+            try:
+                df_fr, stats = fr24src.scrape(bbox, f_lo, f_hi, step_s=step_min * 60, skip_jets=skip_jets,
+                                              username=fu or None, password=fp or None, delay_s=delay,
+                                              progress=lambda x, m: bar.progress(min(x, 1.0), m), out_path=outp)
+                S.flights = df_fr
+                st.success(f"{stats.summary()}. Saved to {outp}")
+                if stats.errors:
+                    with st.expander(f"{len(stats.errors)} warnings"):
+                        st.code("\n".join(stats.errors))
+            except Exception as e:
+                st.error(f"Flightradar24 download failed: {e}")
+    elif src == "Local files / folder":
         p = st.text_input("Path(s), comma-separated: CSV / parquet / readsb trace_full JSON / folder / .tar",
                           help="Big data stays on disk - only points inside the area & time window are kept.")
         if st.button("Load", disabled=not p):

@@ -6,4 +6,5 @@ plotly>=6.0
 streamlit>=1.40
 yt-dlp>=2025.1.1
 requests>=2.31
+fr24[curl]>=0.4      # Flightradar24 historical tracks (the scraper from the video)
 # optional: pyopensky (OpenSky historical database access)
